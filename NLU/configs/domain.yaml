@@ -1,0 +1,240 @@
+# NLU Domain Schema - Example Configuration
+# This file defines the intents, entity types, and slot definitions
+# that the NLU system should recognize.
+
+name: "default"
+description: "Default NLU domain schema with common intents and entities"
+
+# Supported intents
+intents:
+  - name: "greeting"
+    description: "User greets the system"
+    examples:
+      - "你好"
+      - "hi"
+      - "hello"
+      - "早上好"
+
+  - name: "goodbye"
+    description: "User says goodbye"
+    examples:
+      - "再见"
+      - "bye"
+      - "拜拜"
+
+  - name: "ask_question"
+    description: "User asks a question"
+    examples:
+      - "请问..."
+      - "我想知道..."
+      - "能告诉我..."
+
+  - name: "book_flight"
+    description: "User wants to book a flight"
+    examples:
+      - "我要订一张机票"
+      - "帮我订从北京到上海的机票"
+      - "book a flight from Beijing to Shanghai"
+    slots:
+      - "departure_city"
+      - "arrival_city"
+      - "departure_date"
+      - "passenger_count"
+
+  - name: "book_hotel"
+    description: "User wants to book a hotel"
+    examples:
+      - "我要订酒店"
+      - "帮我找一个酒店"
+    slots:
+      - "city"
+      - "check_in_date"
+      - "check_out_date"
+      - "guest_count"
+
+  - name: "weather_query"
+    description: "User asks about weather"
+    examples:
+      - "今天天气怎么样"
+      - "明天会下雨吗"
+      - "北京的天气"
+    slots:
+      - "city"
+      - "date"
+
+  - name: "set_reminder"
+    description: "User wants to set a reminder"
+    examples:
+      - "提醒我明天开会"
+      - "帮我设置一个闹钟"
+    slots:
+      - "reminder_time"
+      - "reminder_content"
+
+  - name: "play_music"
+    description: "User wants to play music"
+    examples:
+      - "播放音乐"
+      - "放一首歌"
+      - "play some music"
+    slots:
+      - "song_name"
+      - "artist"
+      - "genre"
+
+  - name: "complaint"
+    description: "User is making a complaint"
+    examples:
+      - "我要投诉"
+      - "服务太差了"
+      - "这个产品有问题"
+
+  - name: "help"
+    description: "User asks for help"
+    examples:
+      - "帮助"
+      - "我需要帮助"
+      - "你能做什么"
+
+  - name: "unknown"
+    description: "Unrecognized intent"
+    examples: []
+
+# Supported entity types
+entity_types:
+  - name: "PERSON"
+    description: "Person name"
+    examples: ["张三", "李四", "John"]
+
+  - name: "LOCATION"
+    description: "Location or place name"
+    examples: ["北京", "上海", "New York"]
+
+  - name: "ORGANIZATION"
+    description: "Organization or company name"
+    examples: ["Huawei", "Apple", "Google"]
+
+  - name: "DATE"
+    description: "Date or time expression"
+    examples: ["明天", "下周一", "2024年3月15日"]
+
+  - name: "TIME"
+    description: "Time expression"
+    examples: ["下午3点", "8:00", "晚上"]
+
+  - name: "NUMBER"
+    description: "Numerical value"
+    examples: ["3", "两百", "1000"]
+
+  - name: "MONEY"
+    description: "Monetary amount"
+    examples: ["100元", "$50", "一千块"]
+
+  - name: "PRODUCT"
+    description: "Product name"
+    examples: ["iPhone", "Model X", "Pixel 9"]
+
+  - name: "SONG"
+    description: "Song or music title"
+    examples: ["稻香", "Shape of You"]
+
+  - name: "ARTIST"
+    description: "Artist or performer name"
+    examples: ["周杰伦", "Taylor Swift"]
+
+# Slot definitions
+slot_definitions:
+  - name: "departure_city"
+    type: "city"
+    required: true
+    prompt: "请问您从哪个城市出发？"
+    description: "Departure city for a flight"
+
+  - name: "arrival_city"
+    type: "city"
+    required: true
+    prompt: "请问您要去哪个城市？"
+    description: "Arrival city for a flight"
+
+  - name: "departure_date"
+    type: "date"
+    required: true
+    prompt: "请问您什么时候出发？"
+    description: "Departure date"
+
+  - name: "passenger_count"
+    type: "number"
+    required: false
+    default: "1"
+    prompt: "请问有几位乘客？"
+    description: "Number of passengers"
+
+  - name: "city"
+    type: "city"
+    required: true
+    prompt: "请问是哪个城市？"
+    description: "City name"
+
+  - name: "check_in_date"
+    type: "date"
+    required: true
+    prompt: "请问入住日期是？"
+    description: "Hotel check-in date"
+
+  - name: "check_out_date"
+    type: "date"
+    required: true
+    prompt: "请问退房日期是？"
+    description: "Hotel check-out date"
+
+  - name: "guest_count"
+    type: "number"
+    required: false
+    default: "1"
+    prompt: "请问有几位客人？"
+    description: "Number of hotel guests"
+
+  - name: "date"
+    type: "date"
+    required: false
+    description: "Date reference"
+
+  - name: "reminder_time"
+    type: "datetime"
+    required: true
+    prompt: "请问什么时候提醒您？"
+    description: "Time for the reminder"
+
+  - name: "reminder_content"
+    type: "text"
+    required: true
+    prompt: "请问要提醒您什么事？"
+    description: "Content of the reminder"
+
+  - name: "song_name"
+    type: "text"
+    required: false
+    prompt: "请问要播放哪首歌？"
+    description: "Song name to play"
+
+  - name: "artist"
+    type: "text"
+    required: false
+    prompt: "请问是哪位歌手的歌？"
+    description: "Artist name"
+
+  - name: "genre"
+    type: "text"
+    required: false
+    description: "Music genre"
+    enum: ["pop", "rock", "jazz", "classical", "electronic", "hip-hop", "r&b", "country", "folk"]
+
+# Text classification categories
+categories:
+  - "general_conversation"
+  - "task_request"
+  - "information_query"
+  - "complaint"
+  - "feedback"
+  - "emergency"
+  - "small_talk"

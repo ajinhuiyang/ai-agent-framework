@@ -1,0 +1,51 @@
+# NLU Microservice Configuration
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 30   # seconds
+  write_timeout: 30  # seconds
+  mode: "debug"      # "debug", "release", "test"
+
+llm:
+  provider: "ollama"  # "openai" or "ollama"
+  temperature: 0.1
+  max_tokens: 2048
+  max_retries: 3
+  timeout: 60  # seconds
+
+  # OpenAI-compatible API (works with Ollama, vLLM, etc.)
+  openai:
+    api_key: ""  # Set via NLU_LLM_OPENAI_API_KEY env var
+    base_url: "http://localhost:11434/v1"  # Ollama's OpenAI-compatible endpoint
+    model: "qwen2.5-coder-0.5b-q8_0"
+    org_id: ""
+
+  # Native Ollama API
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "qwen2.5-coder-0.5b-q8_0"
+
+nlu:
+  default_capabilities:
+    - "intent"
+    - "ner"
+    - "sentiment"
+  max_dialog_turns: 20
+  domain_schema_path: "./configs/domain.yaml"
+  prompt_template_path: "./configs/prompts"
+  cache_enabled: true
+  cache_ttl: 300  # seconds
+
+logging:
+  level: "info"    # "debug", "info", "warn", "error"
+  format: "json"   # "json", "console"
+
+# Peer service endpoints
+services:
+  rag:
+    base_url: "http://localhost:8081"
+    timeout: 30  # seconds
+  llm_generation:
+    base_url: "http://localhost:8082"
+    timeout: 120  # seconds
