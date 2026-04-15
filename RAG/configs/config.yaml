@@ -1,0 +1,49 @@
+server:
+  host: "0.0.0.0"
+  port: 8081
+  read_timeout: 30
+  write_timeout: 30
+  mode: "debug"  # debug, release, test
+
+# Embedding provider for vectorization
+embedding:
+  provider: "ollama"  # openai, ollama, local
+  openai:
+    api_key: ""
+    base_url: "http://localhost:11434/v1"  # Ollama OpenAI-compatible endpoint
+    model: "nomic-embed-text"
+    dimension: 768
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "nomic-embed-text"
+    dimension: 768
+
+# Vector store configuration
+vectorstore:
+  type: "memory"  # memory, milvus
+  milvus:
+    address: "localhost:19530"
+    database: "default"
+
+# Text splitting configuration
+splitter:
+  chunk_size: 512
+  chunk_overlap: 64
+  separator: "\n\n"
+
+# Retrieval configuration
+retriever:
+  default_top_k: 5
+  min_score: 0.3
+  rerank_enabled: false
+
+# Web search (optional online augmentation)
+web_search:
+  enabled: false
+  api_key: ""
+  engine: "serper"  # serper, google, bing
+
+# Logging
+logging:
+  level: "info"
+  format: "console"  # console, json
