@@ -85,7 +85,7 @@ type kvCache struct {
 
 // Engine is the native pure-Go Transformer inference engine.
 type Engine struct {
-	mu     sync.RWMutex
+	mu     sync.Mutex
 	loaded bool
 
 	config  ModelConfig
@@ -94,7 +94,84 @@ type Engine struct {
 	cache   []kvCache // per-layer KV cache
 	meta    *engine.ModelMeta
 
+	// Pre-allocated buffers to avoid GC pressure during inference.
+	buffers *inferBuffers
+
+	// Worker pool for parallel matVecMul.
+	workerPool *workerPool
+
 	logger *zap.Logger
+}
+
+// inferBuffers holds pre-allocated scratch space for a single forward pass.
+type inferBuffers struct {
+	x       []float32 // [hidden] current hidden state
+	normed  []float32 // [hidden] normalized hidden state
+	q       []float32 // [hidden] query projection
+	k       []float32 // [kv_dim] key projection
+	v       []float32 // [kv_dim] value projection
+	attnOut []float32 // [hidden] attention output
+	proj    []float32 // [hidden] output projection scratch
+	gate    []float32 // [intermediate] FFN gate
+	up      []float32 // [intermediate] FFN up
+	ffnOut  []float32 // [hidden] FFN output
+	logits  []float32 // [vocab] output logits
+	scores  []float32 // [max_seq_len] attention scores scratch
+}
+
+// workerPool provides a fixed set of goroutines for parallel matVecMul.
+type workerPool struct {
+	numWorkers int
+	jobs       []chan matJob
+	done       []chan struct{}
+}
+
+type matJob struct {
+	out    []float32
+	mat    []float32
+	vec    []float32
+	startR int
+	endR   int
+	cols   int
+}
+
+func newWorkerPool(numWorkers int) *workerPool {
+	wp := &workerPool{
+		numWorkers: numWorkers,
+		jobs:       make([]chan matJob, numWorkers),
+		done:       make([]chan struct{}, numWorkers),
+	}
+	for i := 0; i < numWorkers; i++ {
+		wp.jobs[i] = make(chan matJob, 1)
+		wp.done[i] = make(chan struct{}, 1)
+		go func(id int) {
+			for job := range wp.jobs[id] {
+				matVecMulChunk(job.out, job.mat, job.vec, job.startR, job.endR, job.cols)
+				wp.done[id] <- struct{}{}
+			}
+		}(i)
+	}
+	return wp
+}
+
+func (wp *workerPool) dispatch(out, mat, vec []float32, rows, cols int) {
+	chunkSize := (rows + wp.numWorkers - 1) / wp.numWorkers
+	active := 0
+	for w := 0; w < wp.numWorkers; w++ {
+		s := w * chunkSize
+		e := s + chunkSize
+		if e > rows {
+			e = rows
+		}
+		if s >= e {
+			break
+		}
+		wp.jobs[w] <- matJob{out: out, mat: mat, vec: vec, startR: s, endR: e, cols: cols}
+		active++
+	}
+	for w := 0; w < active; w++ {
+		<-wp.done[w]
+	}
 }
 
 // New creates a new native Transformer engine.
@@ -102,7 +179,10 @@ func New(logger *zap.Logger) *Engine {
 	if logger == nil {
 		logger, _ = zap.NewDevelopment()
 	}
-	return &Engine{logger: logger}
+	return &Engine{
+		logger:     logger,
+		workerPool: newWorkerPool(runtime.NumCPU()),
+	}
 }
 
 // Load loads a GGUF model file, parses metadata, and dequantizes all weights.
@@ -177,6 +257,23 @@ func (e *Engine) Load(ctx context.Context, modelPath string, opts engine.LoadOpt
 		FileSizeBytes: fileSize,
 	}
 
+	// Pre-allocate inference buffers.
+	kvDimBuf := cfg.NumKVHeads * cfg.HeadDim
+	e.buffers = &inferBuffers{
+		x:       make([]float32, cfg.HiddenSize),
+		normed:  make([]float32, cfg.HiddenSize),
+		q:       make([]float32, cfg.HiddenSize),
+		k:       make([]float32, kvDimBuf),
+		v:       make([]float32, kvDimBuf),
+		attnOut: make([]float32, cfg.HiddenSize),
+		proj:    make([]float32, cfg.HiddenSize),
+		gate:    make([]float32, cfg.IntermediateSize),
+		up:      make([]float32, cfg.IntermediateSize),
+		ffnOut:  make([]float32, cfg.HiddenSize),
+		logits:  make([]float32, cfg.VocabSize),
+		scores:  make([]float32, cfg.MaxSeqLen),
+	}
+
 	e.loaded = true
 	e.logger.Info("model loaded",
 		zap.Duration("elapsed", time.Since(start)),
@@ -227,7 +324,10 @@ func (e *Engine) Predict(ctx context.Context, req domain.InferenceRequest) (engi
 		default:
 		}
 
-		logits := e.forward(tokens)
+		logitsRef := e.forward(tokens)
+		// Copy logits since sample modifies in-place and buffer is reused.
+		logits := make([]float32, len(logitsRef))
+		copy(logits, logitsRef)
 		nextToken := e.sample(logits, req.Options)
 
 		if nextToken == e.tok.EOSID() {
@@ -286,7 +386,9 @@ func (e *Engine) PredictStream(ctx context.Context, req domain.InferenceRequest)
 			default:
 			}
 
-			logits := e.forward(tokens)
+			logitsRef := e.forward(tokens)
+			logits := make([]float32, len(logitsRef))
+			copy(logits, logitsRef)
 			nextToken := e.sample(logits, req.Options)
 
 			if nextToken == e.tok.EOSID() {
@@ -312,8 +414,8 @@ func (e *Engine) PredictStream(ctx context.Context, req domain.InferenceRequest)
 
 // Embed generates embeddings by running the model's embedding layer.
 func (e *Engine) Embed(_ context.Context, texts []string) ([][]float32, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	if !e.loaded {
 		return nil, fmt.Errorf("no model loaded")
@@ -359,8 +461,8 @@ func (e *Engine) Embed(_ context.Context, texts []string) ([][]float32, error) {
 }
 
 func (e *Engine) TokenCount(_ context.Context, text string) (int, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if !e.loaded {
 		return 0, fmt.Errorf("no model loaded")
 	}
@@ -368,14 +470,14 @@ func (e *Engine) TokenCount(_ context.Context, text string) (int, error) {
 }
 
 func (e *Engine) ModelInfo() *engine.ModelMeta {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.meta
 }
 
 func (e *Engine) IsLoaded() bool {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return e.loaded
 }
 
@@ -411,8 +513,11 @@ func (e *Engine) forward(tokens []int) []float32 {
 
 	// Output projection (only for the last token).
 	lastHidden := x[(seqLen-1)*hidden : seqLen*hidden]
-	logits := make([]float32, cfg.VocabSize)
-	matVecMul(logits, e.weights.Output, lastHidden, cfg.VocabSize, hidden)
+	logits := e.buffers.logits
+	for i := range logits {
+		logits[i] = 0
+	}
+	e.matVecMulPooled(logits, e.weights.Output, lastHidden, cfg.VocabSize, hidden)
 
 	return logits
 }
@@ -472,13 +577,22 @@ func (e *Engine) selfAttention(x []float32, seqLen, layer int) []float32 {
 	for pos := 0; pos < seqLen; pos++ {
 		xPos := x[pos*hidden : (pos+1)*hidden]
 
-		// Project Q, K, V.
-		q := make([]float32, hidden)
-		k := make([]float32, kvDim)
-		v := make([]float32, kvDim)
-		matVecMul(q, lw.Wq, xPos, hidden, hidden)
-		matVecMul(k, lw.Wk, xPos, kvDim, hidden)
-		matVecMul(v, lw.Wv, xPos, kvDim, hidden)
+		// Project Q, K, V using pre-allocated buffers.
+		q := e.buffers.q
+		k := e.buffers.k
+		v := e.buffers.v
+		for i := range q {
+			q[i] = 0
+		}
+		for i := range k {
+			k[i] = 0
+		}
+		for i := range v {
+			v[i] = 0
+		}
+		e.matVecMulPooled(q, lw.Wq, xPos, hidden, hidden)
+		e.matVecMulPooled(k, lw.Wk, xPos, kvDim, hidden)
+		e.matVecMulPooled(v, lw.Wv, xPos, kvDim, hidden)
 
 		// Add biases (Qwen2 has attention biases).
 		if lw.Bq != nil {
@@ -544,8 +658,11 @@ func (e *Engine) selfAttention(x []float32, seqLen, layer int) []float32 {
 		}
 
 		// Output projection.
-		projected := make([]float32, hidden)
-		matVecMul(projected, lw.Wo, out[pos*hidden:(pos+1)*hidden], hidden, hidden)
+		projected := e.buffers.proj
+		for i := range projected {
+			projected[i] = 0
+		}
+		e.matVecMulPooled(projected, lw.Wo, out[pos*hidden:(pos+1)*hidden], hidden, hidden)
 		copy(out[pos*hidden:], projected)
 	}
 
@@ -564,18 +681,37 @@ func (e *Engine) feedForward(x []float32, seqLen, layer int) []float32 {
 	for pos := 0; pos < seqLen; pos++ {
 		xPos := x[pos*hidden : (pos+1)*hidden]
 
-		gate := make([]float32, inter)
-		up := make([]float32, inter)
-		matVecMul(gate, lw.WGate, xPos, inter, hidden)
-		matVecMul(up, lw.WUp, xPos, inter, hidden)
+		gate := e.buffers.gate
+		up := e.buffers.up
+		for i := range gate {
+			gate[i] = 0
+		}
+		for i := range up {
+			up[i] = 0
+		}
+
+		// Gate and Up projections — run in parallel using two halves of worker pool.
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			matVecMulChunk(up, lw.WUp, xPos, 0, inter, hidden)
+		}()
+		matVecMulChunk(gate, lw.WGate, xPos, 0, inter, hidden)
+		wg.Wait()
 
 		// SwiGLU activation: silu(gate) * up
-		for i := range gate {
+		for i := 0; i < inter; i++ {
 			gate[i] = silu(gate[i]) * up[i]
 		}
 
 		// Down projection.
-		matVecMul(out[pos*hidden:(pos+1)*hidden], lw.WDown, gate, hidden, inter)
+		ffnOut := e.buffers.ffnOut
+		for i := range ffnOut {
+			ffnOut[i] = 0
+		}
+		e.matVecMulPooled(ffnOut, lw.WDown, gate, hidden, inter)
+		copy(out[pos*hidden:], ffnOut)
 	}
 
 	return out
@@ -596,57 +732,39 @@ func (e *Engine) resetCache() {
 // ======================================================================
 
 // matVecMul computes out = mat * vec, where mat is [rows, cols] row-major.
-// Uses goroutine parallelism for large matrices.
-func matVecMul(out, mat, vec []float32, rows, cols int) {
+// Dispatches to worker pool for large matrices.
+func (e *Engine) matVecMulPooled(out, mat, vec []float32, rows, cols int) {
 	if rows < 256 {
-		// Small matrix: single-threaded.
-		for i := 0; i < rows; i++ {
-			var sum float32
-			rowOff := i * cols
-			for j := 0; j < cols; j++ {
-				sum += mat[rowOff+j] * vec[j]
-			}
-			out[i] = sum
-		}
+		matVecMulChunk(out, mat, vec, 0, rows, cols)
 		return
 	}
+	e.workerPool.dispatch(out, mat, vec, rows, cols)
+}
 
-	// Large matrix: parallel with goroutines.
-	numWorkers := runtime.NumCPU()
-	chunkSize := (rows + numWorkers - 1) / numWorkers
-
-	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
-		start := w * chunkSize
-		end := start + chunkSize
-		if end > rows {
-			end = rows
+// matVecMulChunk computes a chunk of rows for matVecMul.
+// Uses 8x unrolling and accumulator splitting for better ILP.
+func matVecMulChunk(out, mat, vec []float32, startRow, endRow, cols int) {
+	for i := startRow; i < endRow; i++ {
+		var s0, s1, s2, s3 float32
+		rowOff := i * cols
+		row := mat[rowOff : rowOff+cols]
+		j := 0
+		for ; j+7 < cols; j += 8 {
+			s0 += row[j]*vec[j] + row[j+1]*vec[j+1]
+			s1 += row[j+2]*vec[j+2] + row[j+3]*vec[j+3]
+			s2 += row[j+4]*vec[j+4] + row[j+5]*vec[j+5]
+			s3 += row[j+6]*vec[j+6] + row[j+7]*vec[j+7]
 		}
-		if start >= end {
-			break
+		for ; j < cols; j++ {
+			s0 += row[j] * vec[j]
 		}
-		wg.Add(1)
-		go func(s, e int) {
-			defer wg.Done()
-			for i := s; i < e; i++ {
-				var sum float32
-				rowOff := i * cols
-				// Unroll loop by 4 for better performance.
-				j := 0
-				for ; j+3 < cols; j += 4 {
-					sum += mat[rowOff+j]*vec[j] +
-						mat[rowOff+j+1]*vec[j+1] +
-						mat[rowOff+j+2]*vec[j+2] +
-						mat[rowOff+j+3]*vec[j+3]
-				}
-				for ; j < cols; j++ {
-					sum += mat[rowOff+j] * vec[j]
-				}
-				out[i] = sum
-			}
-		}(start, end)
+		out[i] = s0 + s1 + s2 + s3
 	}
-	wg.Wait()
+}
+
+// matVecMul is the standalone version (used during weight loading).
+func matVecMul(out, mat, vec []float32, rows, cols int) {
+	matVecMulChunk(out, mat, vec, 0, rows, cols)
 }
 
 // rmsNorm applies Root Mean Square Layer Normalization in-place.
