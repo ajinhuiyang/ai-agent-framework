@@ -131,9 +131,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("llm.temperature", 0.1)
 	v.SetDefault("llm.max_tokens", 2048)
 	v.SetDefault("llm.openai.base_url", "http://localhost:11434/v1")
-	v.SetDefault("llm.openai.model", "qwen2.5-0.5b-instruct-q8_0")
+	v.SetDefault("llm.openai.model", "qwen2.5-coder-3b-instruct-q8_0")
 	v.SetDefault("llm.ollama.base_url", "http://localhost:11434")
-	v.SetDefault("llm.ollama.model", "qwen2.5-0.5b-instruct-q8_0")
+	v.SetDefault("llm.ollama.model", "qwen2.5-coder-3b-instruct-q8_0")
 
 	// NLU
 	v.SetDefault("nlu.default_capabilities", []string{"intent", "ner", "sentiment"})

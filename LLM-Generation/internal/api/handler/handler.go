@@ -148,3 +148,134 @@ func (h *Handler) ListProviders(c *gin.Context) {
 	infos := h.orch.ListProviders(c.Request.Context())
 	c.JSON(http.StatusOK, APIResponse{Success: true, Data: infos})
 }
+
+// --- Code-specific endpoints ---
+
+// CodeAnalyze handles POST /api/v1/llm/code/analyze
+func (h *Handler) CodeAnalyze(c *gin.Context) {
+	h.handleCode(c, "analyze", "code_analyze")
+}
+
+// CodeGenerate handles POST /api/v1/llm/code/generate
+func (h *Handler) CodeGenerate(c *gin.Context) {
+	h.handleCode(c, "generate", "code_generate")
+}
+
+// CodeExplain handles POST /api/v1/llm/code/explain
+func (h *Handler) CodeExplain(c *gin.Context) {
+	h.handleCode(c, "explain", "code_explain")
+}
+
+// CodeRefactor handles POST /api/v1/llm/code/refactor
+func (h *Handler) CodeRefactor(c *gin.Context) {
+	h.handleCode(c, "refactor", "code_refactor")
+}
+
+// CodeTest handles POST /api/v1/llm/code/test
+func (h *Handler) CodeTest(c *gin.Context) {
+	h.handleCode(c, "test", "code_test")
+}
+
+// CodeReview handles POST /api/v1/llm/code/review
+func (h *Handler) CodeReview(c *gin.Context) {
+	h.handleCode(c, "review", "code_review")
+}
+
+// handleCode is the shared handler for all code operations.
+func (h *Handler) handleCode(c *gin.Context, codeType, systemPromptKey string) {
+	var req domain.CodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, APIResponse{
+			Error: &APIError{Code: 400, Message: "invalid request: " + err.Error()},
+		})
+		return
+	}
+
+	// Build the user prompt based on operation type.
+	var userPrompt string
+	lang := req.Language
+	if lang == "" {
+		lang = "unknown"
+	}
+
+	switch codeType {
+	case "analyze":
+		if req.Code == "" {
+			c.JSON(http.StatusBadRequest, APIResponse{Error: &APIError{Code: 400, Message: "code is required"}})
+			return
+		}
+		userPrompt = fmt.Sprintf("Analyze the following %s code:\n\n```%s\n%s\n```", lang, lang, req.Code)
+
+	case "generate":
+		if req.Description == "" {
+			c.JSON(http.StatusBadRequest, APIResponse{Error: &APIError{Code: 400, Message: "description is required"}})
+			return
+		}
+		userPrompt = fmt.Sprintf("Generate %s code for the following requirement:\n\n%s", lang, req.Description)
+
+	case "explain":
+		if req.Code == "" {
+			c.JSON(http.StatusBadRequest, APIResponse{Error: &APIError{Code: 400, Message: "code is required"}})
+			return
+		}
+		userPrompt = fmt.Sprintf("Explain the following %s code line by line:\n\n```%s\n%s\n```", lang, lang, req.Code)
+
+	case "refactor":
+		if req.Code == "" {
+			c.JSON(http.StatusBadRequest, APIResponse{Error: &APIError{Code: 400, Message: "code is required"}})
+			return
+		}
+		userPrompt = fmt.Sprintf("Refactor and improve the following %s code:\n\n```%s\n%s\n```", lang, lang, req.Code)
+
+	case "test":
+		if req.Code == "" {
+			c.JSON(http.StatusBadRequest, APIResponse{Error: &APIError{Code: 400, Message: "code is required"}})
+			return
+		}
+		fw := req.TestFramework
+		if fw == "" {
+			fw = "standard library"
+		}
+		userPrompt = fmt.Sprintf("Generate unit tests using %s for the following %s code:\n\n```%s\n%s\n```", fw, lang, lang, req.Code)
+
+	case "review":
+		if req.Code == "" && req.Diff == "" {
+			c.JSON(http.StatusBadRequest, APIResponse{Error: &APIError{Code: 400, Message: "code or diff is required"}})
+			return
+		}
+		if req.Diff != "" {
+			userPrompt = fmt.Sprintf("Review the following code diff:\n\n```diff\n%s\n```", req.Diff)
+		} else {
+			userPrompt = fmt.Sprintf("Review the following %s code:\n\n```%s\n%s\n```", lang, lang, req.Code)
+		}
+	}
+
+	// Generate using the orchestrator with the appropriate system prompt.
+	genReq := domain.GenerateRequest{
+		Prompt:       userPrompt,
+		SystemPrompt: systemPromptKey, // Orchestrator/prompt manager resolves this
+		Provider:     req.Provider,
+		Config:       req.Config,
+	}
+
+	result, err := h.orch.Generate(c.Request.Context(), genReq)
+	if err != nil {
+		h.logger.Error("code operation failed", zap.String("type", codeType), zap.Error(err))
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Error: &APIError{Code: 500, Message: codeType + " failed: " + err.Error()},
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Data: domain.CodeResponse{
+			Result:   result.Content,
+			Type:     codeType,
+			Language: req.Language,
+			Provider: result.Provider,
+			Model:    result.Model,
+			Usage:    result.Usage,
+		},
+	})
+}

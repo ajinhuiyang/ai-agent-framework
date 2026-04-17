@@ -1,0 +1,467 @@
+{
+	"info": {
+		"_postman_id": "goinfer-collection-001",
+		"name": "GoInfer API",
+		"description": "Complete API collection for GoInfer — Local AI inference stack with NLU, RAG, LLM-Generation, and Local-LLM services.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{"key": "nlu_url", "value": "http://localhost:8080"},
+		{"key": "rag_url", "value": "http://localhost:8081"},
+		{"key": "llm_url", "value": "http://localhost:8082"},
+		{"key": "local_llm_url", "value": "http://localhost:11434"},
+		{"key": "model", "value": "qwen2.5-coder-3b-instruct-q8_0"}
+	],
+	"item": [
+		{
+			"name": "Health Checks",
+			"item": [
+				{
+					"name": "NLU Health",
+					"request": {
+						"method": "GET",
+						"url": "{{nlu_url}}/health"
+					}
+				},
+				{
+					"name": "RAG Health",
+					"request": {
+						"method": "GET",
+						"url": "{{rag_url}}/health"
+					}
+				},
+				{
+					"name": "LLM-Generation Health",
+					"request": {
+						"method": "GET",
+						"url": "{{llm_url}}/health"
+					}
+				},
+				{
+					"name": "Local-LLM Health",
+					"request": {
+						"method": "GET",
+						"url": "{{local_llm_url}}/"
+					}
+				}
+			]
+		},
+		{
+			"name": "Local-LLM (Ollama-Compatible)",
+			"item": [
+				{
+					"name": "Chat",
+					"request": {
+						"method": "POST",
+						"url": "{{local_llm_url}}/api/chat",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"stream\": false,\n  \"messages\": [\n    {\"role\": \"system\", \"content\": \"You are a helpful code assistant.\"},\n    {\"role\": \"user\", \"content\": \"Write a hello world in Go\"}\n  ]\n}"
+						}
+					}
+				},
+				{
+					"name": "Chat (Streaming)",
+					"request": {
+						"method": "POST",
+						"url": "{{local_llm_url}}/api/chat",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"stream\": true,\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Hello\"}\n  ]\n}"
+						}
+					}
+				},
+				{
+					"name": "Generate",
+					"request": {
+						"method": "POST",
+						"url": "{{local_llm_url}}/api/generate",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"prompt\": \"Explain what a goroutine is\",\n  \"stream\": false\n}"
+						}
+					}
+				},
+				{
+					"name": "Embed",
+					"request": {
+						"method": "POST",
+						"url": "{{local_llm_url}}/api/embed",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"input\": \"func main() { fmt.Println(\\\"hello\\\") }\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Embed (Batch)",
+					"request": {
+						"method": "POST",
+						"url": "{{local_llm_url}}/api/embed",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"input\": [\"goroutine\", \"channel\", \"mutex\"]\n}"
+						}
+					}
+				},
+				{
+					"name": "List Models",
+					"request": {
+						"method": "GET",
+						"url": "{{local_llm_url}}/api/tags"
+					}
+				},
+				{
+					"name": "Show Model Info",
+					"request": {
+						"method": "POST",
+						"url": "{{local_llm_url}}/api/show",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"name\": \"{{model}}\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Version",
+					"request": {
+						"method": "GET",
+						"url": "{{local_llm_url}}/api/version"
+					}
+				},
+				{
+					"name": "Chat with Options",
+					"request": {
+						"method": "POST",
+						"url": "{{local_llm_url}}/api/chat",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"{{model}}\",\n  \"stream\": false,\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Write a quicksort in Python\"}\n  ],\n  \"options\": {\n    \"temperature\": 0.3,\n    \"top_p\": 0.9,\n    \"top_k\": 40,\n    \"num_predict\": 512\n  }\n}"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "NLU (Intent Understanding)",
+			"item": [
+				{
+					"name": "Full Pipeline (NLU → RAG → LLM)",
+					"request": {
+						"method": "POST",
+						"url": "{{nlu_url}}/api/v1/nlu/ask",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"text\": \"How do I implement a binary search in Go?\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Intent Recognition",
+					"request": {
+						"method": "POST",
+						"url": "{{nlu_url}}/api/v1/nlu/intent",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"text\": \"Help me write a REST API in Go\",\n  \"language\": \"en\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Entity Extraction",
+					"request": {
+						"method": "POST",
+						"url": "{{nlu_url}}/api/v1/nlu/ner",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"text\": \"Fix the NullPointerException in UserService.java line 42\",\n  \"language\": \"en\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Sentiment Analysis",
+					"request": {
+						"method": "POST",
+						"url": "{{nlu_url}}/api/v1/nlu/sentiment",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"text\": \"This library is terrible, the API is confusing and buggy\",\n  \"language\": \"en\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Text Classification",
+					"request": {
+						"method": "POST",
+						"url": "{{nlu_url}}/api/v1/nlu/classify",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"text\": \"How to deploy a Docker container to Kubernetes?\",\n  \"language\": \"en\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Slot Filling",
+					"request": {
+						"method": "POST",
+						"url": "{{nlu_url}}/api/v1/nlu/slot",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"text\": \"Write a quicksort function in Python using pytest\",\n  \"language\": \"en\",\n  \"slot_config\": {\n    \"slot_definitions\": [\n      {\"name\": \"language\", \"type\": \"text\", \"required\": true, \"prompt\": \"Which language?\"},\n      {\"name\": \"task_description\", \"type\": \"text\", \"required\": true, \"prompt\": \"What to code?\"},\n      {\"name\": \"test_framework\", \"type\": \"text\", \"required\": false}\n    ]\n  }\n}"
+						}
+					}
+				},
+				{
+					"name": "Full NLU Process",
+					"request": {
+						"method": "POST",
+						"url": "{{nlu_url}}/api/v1/nlu/process",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"text\": \"Refactor this Python code to use list comprehension\",\n  \"language\": \"en\",\n  \"capabilities\": [\"intent\", \"ner\", \"sentiment\"]\n}"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "RAG (Knowledge Retrieval)",
+			"item": [
+				{
+					"name": "Ingest Documents",
+					"request": {
+						"method": "POST",
+						"url": "{{rag_url}}/api/v1/rag/ingest",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"documents\": [\n    {\n      \"content\": \"Go's goroutines are lightweight threads managed by the Go runtime. They are created with the 'go' keyword and are much cheaper than OS threads.\",\n      \"source\": \"go-docs\",\n      \"metadata\": {\"topic\": \"concurrency\"}\n    },\n    {\n      \"content\": \"Channels in Go provide a way for goroutines to communicate. They can be buffered or unbuffered. Use 'make(chan Type)' to create one.\",\n      \"source\": \"go-docs\",\n      \"metadata\": {\"topic\": \"concurrency\"}\n    }\n  ],\n  \"collection\": \"go-knowledge\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Semantic Search",
+					"request": {
+						"method": "POST",
+						"url": "{{rag_url}}/api/v1/rag/search",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"How do goroutines work?\",\n  \"top_k\": 5,\n  \"collection\": \"go-knowledge\"\n}"
+						}
+					}
+				},
+				{
+					"name": "List Collections",
+					"request": {
+						"method": "GET",
+						"url": "{{rag_url}}/api/v1/rag/collections"
+					}
+				},
+				{
+					"name": "Delete Collection",
+					"request": {
+						"method": "DELETE",
+						"url": "{{rag_url}}/api/v1/rag/collections/go-knowledge"
+					}
+				},
+				{
+					"name": "Fetch Web Page",
+					"request": {
+						"method": "POST",
+						"url": "{{rag_url}}/api/v1/rag/fetch/web",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"url\": \"https://go.dev/doc/effective_go\",\n  \"collection\": \"go-knowledge\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Fetch Search Results",
+					"request": {
+						"method": "POST",
+						"url": "{{rag_url}}/api/v1/rag/fetch/search",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"query\": \"Go error handling best practices\",\n  \"engine\": \"google\",\n  \"top_n\": 3,\n  \"collection\": \"go-knowledge\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Fetch Local File",
+					"request": {
+						"method": "POST",
+						"url": "{{rag_url}}/api/v1/rag/fetch/file",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"path\": \"./README.md\",\n  \"collection\": \"project-docs\"\n}"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "LLM-Generation (Content Generation)",
+			"item": [
+				{
+					"name": "Generate",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/generate",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"prompt\": \"Explain the difference between a mutex and a channel in Go\",\n  \"provider\": \"ollama\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Generate with Context",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/generate",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"prompt\": \"How do I use goroutines?\",\n  \"provider\": \"ollama\",\n  \"context\": [\n    {\"content\": \"Goroutines are lightweight threads managed by Go runtime.\", \"source\": \"go-docs\"}\n  ]\n}"
+						}
+					}
+				},
+				{
+					"name": "Create Conversation",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/conversations"
+					}
+				},
+				{
+					"name": "Get Conversation",
+					"request": {
+						"method": "GET",
+						"url": "{{llm_url}}/api/v1/llm/conversations/{{conversation_id}}"
+					}
+				},
+				{
+					"name": "Delete Conversation",
+					"request": {
+						"method": "DELETE",
+						"url": "{{llm_url}}/api/v1/llm/conversations/{{conversation_id}}"
+					}
+				},
+				{
+					"name": "List Providers",
+					"request": {
+						"method": "GET",
+						"url": "{{llm_url}}/api/v1/llm/providers"
+					}
+				}
+			]
+		},
+		{
+			"name": "Code Operations",
+			"item": [
+				{
+					"name": "Analyze Code",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/code/analyze",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"code\": \"func divide(a, b int) int {\\n    return a / b\\n}\",\n  \"language\": \"go\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Generate Code",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/code/generate",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"description\": \"A function that checks if a string is a valid IPv4 address\",\n  \"language\": \"go\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Explain Code",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/code/explain",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"code\": \"ch := make(chan int, 10)\\nvar wg sync.WaitGroup\\nfor i := 0; i < 10; i++ {\\n    wg.Add(1)\\n    go func(n int) {\\n        defer wg.Done()\\n        ch <- n * n\\n    }(i)\\n}\\ngo func() { wg.Wait(); close(ch) }()\\nfor v := range ch { fmt.Println(v) }\",\n  \"language\": \"go\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Refactor Code",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/code/refactor",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"code\": \"func process(data []string) []string {\\n    result := []string{}\\n    for i := 0; i < len(data); i++ {\\n        if len(data[i]) > 0 {\\n            s := strings.ToLower(data[i])\\n            s = strings.TrimSpace(s)\\n            result = append(result, s)\\n        }\\n    }\\n    return result\\n}\",\n  \"language\": \"go\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Generate Tests",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/code/test",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"code\": \"func Max(a, b int) int {\\n    if a > b {\\n        return a\\n    }\\n    return b\\n}\\n\\nfunc Clamp(val, min, max int) int {\\n    if val < min { return min }\\n    if val > max { return max }\\n    return val\\n}\",\n  \"language\": \"go\",\n  \"test_framework\": \"testing\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Code Review",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/code/review",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"code\": \"func getUserData(id string) (map[string]interface{}, error) {\\n    resp, _ := http.Get(\\\"http://api.example.com/users/\\\" + id)\\n    body, _ := ioutil.ReadAll(resp.Body)\\n    var data map[string]interface{}\\n    json.Unmarshal(body, &data)\\n    return data, nil\\n}\",\n  \"language\": \"go\"\n}"
+						}
+					}
+				},
+				{
+					"name": "Review Diff",
+					"request": {
+						"method": "POST",
+						"url": "{{llm_url}}/api/v1/llm/code/review",
+						"header": [{"key": "Content-Type", "value": "application/json"}],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"diff\": \"- func add(a, b int) int {\\n-     return a - b\\n- }\\n+ func add(a, b int) int {\\n+     return a + b\\n+ }\",\n  \"language\": \"go\"\n}"
+						}
+					}
+				}
+			]
+		}
+	]
+}

@@ -27,6 +27,17 @@ func NewRouter(h *handler.Handler, logger *zap.Logger) *gin.Engine {
 		// Generation
 		v1.POST("/generate", h.Generate)
 
+		// Code operations
+		code := v1.Group("/code")
+		{
+			code.POST("/analyze", h.CodeAnalyze)   // Analyze code for bugs/security/style
+			code.POST("/generate", h.CodeGenerate) // Generate code from description
+			code.POST("/explain", h.CodeExplain)   // Explain what code does
+			code.POST("/refactor", h.CodeRefactor) // Refactor and optimize code
+			code.POST("/test", h.CodeTest)         // Generate unit tests
+			code.POST("/review", h.CodeReview)     // Code review / diff analysis
+		}
+
 		// Conversations
 		v1.POST("/conversations", h.CreateConversation)
 		v1.GET("/conversations/:id", h.GetConversation)

@@ -1,100 +1,92 @@
-# NLU Domain Schema - Example Configuration
-# This file defines the intents, entity types, and slot definitions
-# that the NLU system should recognize.
+# NLU Domain Schema - Code Analysis & Generation
+# Defines intents, entity types, and slot definitions for code-related tasks.
 
-name: "default"
-description: "Default NLU domain schema with common intents and entities"
+name: "code"
+description: "NLU domain schema for code writing, analysis, and review"
 
 # Supported intents
 intents:
-  - name: "greeting"
-    description: "User greets the system"
+  - name: "code_analyze"
+    description: "User wants to analyze code for bugs, complexity, or security issues"
     examples:
-      - "你好"
-      - "hi"
-      - "hello"
-      - "早上好"
+      - "分析这段代码"
+      - "这段代码有什么问题"
+      - "检查一下这个函数"
+      - "analyze this code"
+      - "find bugs in this code"
+      - "这个代码有安全隐患吗"
 
-  - name: "goodbye"
-    description: "User says goodbye"
+  - name: "code_generate"
+    description: "User wants to generate code from a description"
     examples:
-      - "再见"
-      - "bye"
-      - "拜拜"
+      - "帮我写一个函数"
+      - "生成一个排序算法"
+      - "write a function that"
+      - "implement a REST API"
+      - "用Go写一个HTTP服务器"
+      - "create a class that"
+
+  - name: "code_explain"
+    description: "User wants an explanation of what code does"
+    examples:
+      - "这段代码是做什么的"
+      - "解释一下这个函数"
+      - "explain this code"
+      - "what does this function do"
+      - "这行代码什么意思"
+
+  - name: "code_refactor"
+    description: "User wants to refactor or optimize existing code"
+    examples:
+      - "优化这段代码"
+      - "重构一下这个函数"
+      - "refactor this code"
+      - "make this code more efficient"
+      - "这段代码怎么改更好"
+      - "simplify this function"
+
+  - name: "code_test"
+    description: "User wants to generate unit tests for code"
+    examples:
+      - "帮我写单元测试"
+      - "生成测试用例"
+      - "write tests for this function"
+      - "generate unit tests"
+      - "这个函数怎么测试"
+
+  - name: "code_review"
+    description: "User wants a code review or diff analysis"
+    examples:
+      - "帮我review这段代码"
+      - "代码审查"
+      - "review this pull request"
+      - "compare these two implementations"
+      - "这两个版本有什么区别"
+
+  - name: "code_debug"
+    description: "User needs help debugging an error"
+    examples:
+      - "这个报错怎么解决"
+      - "为什么会出现这个错误"
+      - "debug this error"
+      - "how to fix this exception"
+      - "运行报错了"
+
+  - name: "code_document"
+    description: "User wants to generate documentation or comments"
+    examples:
+      - "帮我写注释"
+      - "生成API文档"
+      - "add documentation to this code"
+      - "write comments for this function"
 
   - name: "ask_question"
-    description: "User asks a question"
+    description: "User asks a general programming question"
     examples:
-      - "请问..."
-      - "我想知道..."
-      - "能告诉我..."
-
-  - name: "book_flight"
-    description: "User wants to book a flight"
-    examples:
-      - "我要订一张机票"
-      - "帮我订从北京到上海的机票"
-      - "book a flight from Beijing to Shanghai"
-    slots:
-      - "departure_city"
-      - "arrival_city"
-      - "departure_date"
-      - "passenger_count"
-
-  - name: "book_hotel"
-    description: "User wants to book a hotel"
-    examples:
-      - "我要订酒店"
-      - "帮我找一个酒店"
-    slots:
-      - "city"
-      - "check_in_date"
-      - "check_out_date"
-      - "guest_count"
-
-  - name: "weather_query"
-    description: "User asks about weather"
-    examples:
-      - "今天天气怎么样"
-      - "明天会下雨吗"
-      - "北京的天气"
-    slots:
-      - "city"
-      - "date"
-
-  - name: "set_reminder"
-    description: "User wants to set a reminder"
-    examples:
-      - "提醒我明天开会"
-      - "帮我设置一个闹钟"
-    slots:
-      - "reminder_time"
-      - "reminder_content"
-
-  - name: "play_music"
-    description: "User wants to play music"
-    examples:
-      - "播放音乐"
-      - "放一首歌"
-      - "play some music"
-    slots:
-      - "song_name"
-      - "artist"
-      - "genre"
-
-  - name: "complaint"
-    description: "User is making a complaint"
-    examples:
-      - "我要投诉"
-      - "服务太差了"
-      - "这个产品有问题"
-
-  - name: "help"
-    description: "User asks for help"
-    examples:
-      - "帮助"
-      - "我需要帮助"
-      - "你能做什么"
+      - "什么是goroutine"
+      - "Go和Rust有什么区别"
+      - "how does garbage collection work"
+      - "explain the difference between TCP and UDP"
 
   - name: "unknown"
     description: "Unrecognized intent"
@@ -102,139 +94,89 @@ intents:
 
 # Supported entity types
 entity_types:
-  - name: "PERSON"
-    description: "Person name"
-    examples: ["张三", "李四", "John"]
+  - name: "LANGUAGE"
+    description: "Programming language"
+    examples: ["Go", "Python", "Java", "Rust", "TypeScript", "C++"]
 
-  - name: "LOCATION"
-    description: "Location or place name"
-    examples: ["北京", "上海", "New York"]
+  - name: "FRAMEWORK"
+    description: "Framework or library name"
+    examples: ["Gin", "React", "Spring", "Django", "Express"]
 
-  - name: "ORGANIZATION"
-    description: "Organization or company name"
-    examples: ["Huawei", "Apple", "Google"]
+  - name: "CONCEPT"
+    description: "Programming concept or pattern"
+    examples: ["goroutine", "mutex", "interface", "generics", "closure"]
 
-  - name: "DATE"
-    description: "Date or time expression"
-    examples: ["明天", "下周一", "2024年3月15日"]
+  - name: "ERROR_TYPE"
+    description: "Error or exception type"
+    examples: ["NullPointerException", "segfault", "panic", "TypeError", "404"]
 
-  - name: "TIME"
-    description: "Time expression"
-    examples: ["下午3点", "8:00", "晚上"]
+  - name: "FILE_PATH"
+    description: "File or directory path"
+    examples: ["main.go", "src/index.ts", "/usr/local/bin"]
 
-  - name: "NUMBER"
-    description: "Numerical value"
-    examples: ["3", "两百", "1000"]
+  - name: "FUNCTION_NAME"
+    description: "Function or method name"
+    examples: ["handleRequest", "sort", "parseInt", "main"]
 
-  - name: "MONEY"
-    description: "Monetary amount"
-    examples: ["100元", "$50", "一千块"]
+  - name: "PACKAGE"
+    description: "Package or module name"
+    examples: ["fmt", "net/http", "react", "numpy"]
 
-  - name: "PRODUCT"
-    description: "Product name"
-    examples: ["iPhone", "Model X", "Pixel 9"]
+  - name: "DATA_STRUCTURE"
+    description: "Data structure type"
+    examples: ["array", "map", "linked list", "binary tree", "queue"]
 
-  - name: "SONG"
-    description: "Song or music title"
-    examples: ["稻香", "Shape of You"]
+  - name: "ALGORITHM"
+    description: "Algorithm name"
+    examples: ["quicksort", "binary search", "BFS", "dynamic programming"]
 
-  - name: "ARTIST"
-    description: "Artist or performer name"
-    examples: ["周杰伦", "Taylor Swift"]
+  - name: "TOOL"
+    description: "Development tool"
+    examples: ["Docker", "Git", "Kubernetes", "VS Code", "Webpack"]
 
 # Slot definitions
 slot_definitions:
-  - name: "departure_city"
-    type: "city"
-    required: true
-    prompt: "请问您从哪个城市出发？"
-    description: "Departure city for a flight"
-
-  - name: "arrival_city"
-    type: "city"
-    required: true
-    prompt: "请问您要去哪个城市？"
-    description: "Arrival city for a flight"
-
-  - name: "departure_date"
-    type: "date"
-    required: true
-    prompt: "请问您什么时候出发？"
-    description: "Departure date"
-
-  - name: "passenger_count"
-    type: "number"
-    required: false
-    default: "1"
-    prompt: "请问有几位乘客？"
-    description: "Number of passengers"
-
-  - name: "city"
-    type: "city"
-    required: true
-    prompt: "请问是哪个城市？"
-    description: "City name"
-
-  - name: "check_in_date"
-    type: "date"
-    required: true
-    prompt: "请问入住日期是？"
-    description: "Hotel check-in date"
-
-  - name: "check_out_date"
-    type: "date"
-    required: true
-    prompt: "请问退房日期是？"
-    description: "Hotel check-out date"
-
-  - name: "guest_count"
-    type: "number"
-    required: false
-    default: "1"
-    prompt: "请问有几位客人？"
-    description: "Number of hotel guests"
-
-  - name: "date"
-    type: "date"
-    required: false
-    description: "Date reference"
-
-  - name: "reminder_time"
-    type: "datetime"
-    required: true
-    prompt: "请问什么时候提醒您？"
-    description: "Time for the reminder"
-
-  - name: "reminder_content"
-    type: "text"
-    required: true
-    prompt: "请问要提醒您什么事？"
-    description: "Content of the reminder"
-
-  - name: "song_name"
+  - name: "language"
     type: "text"
     required: false
-    prompt: "请问要播放哪首歌？"
-    description: "Song name to play"
+    prompt: "Which programming language?"
+    description: "Target programming language"
 
-  - name: "artist"
+  - name: "code_input"
     type: "text"
     required: false
-    prompt: "请问是哪位歌手的歌？"
-    description: "Artist name"
+    prompt: "Please provide the code to analyze."
+    description: "The code snippet to work with"
 
-  - name: "genre"
+  - name: "task_description"
     type: "text"
     required: false
-    description: "Music genre"
-    enum: ["pop", "rock", "jazz", "classical", "electronic", "hip-hop", "r&b", "country", "folk"]
+    prompt: "What should the code do?"
+    description: "Description of what code to generate"
+
+  - name: "framework"
+    type: "text"
+    required: false
+    description: "Target framework or library"
+
+  - name: "test_framework"
+    type: "text"
+    required: false
+    description: "Testing framework to use"
+    enum: ["testing", "pytest", "jest", "junit", "mocha", "ginkgo"]
+
+  - name: "style"
+    type: "text"
+    required: false
+    description: "Code style or convention"
+    enum: ["clean", "verbose", "minimal", "production", "prototype"]
 
 # Text classification categories
 categories:
-  - "general_conversation"
-  - "task_request"
-  - "information_query"
-  - "complaint"
-  - "feedback"
-  - "emergency"
-  - "small_talk"
+  - "code_writing"
+  - "code_analysis"
+  - "code_review"
+  - "debugging"
+  - "learning"
+  - "architecture"
+  - "devops"

@@ -28,6 +28,14 @@ func NewRouter(h *handler.Handler, logger *zap.Logger) *gin.Engine {
 		v1.POST("/search", h.Search)                        // Semantic search
 		v1.GET("/collections", h.ListCollections)           // List collections
 		v1.DELETE("/collections/:name", h.DeleteCollection) // Delete collection
+
+		// Content fetching — scrape external sources and auto-ingest
+		fetch := v1.Group("/fetch")
+		{
+			fetch.POST("/web", h.FetchWeb)       // Scrape a URL
+			fetch.POST("/search", h.FetchSearch) // Search engine scraping
+			fetch.POST("/file", h.FetchFile)     // Parse local files
+		}
 	}
 
 	return r

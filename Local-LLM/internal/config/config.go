@@ -62,7 +62,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("server.write_timeout", 300)
 	v.SetDefault("server.mode", "debug")
 	v.SetDefault("models.dir", "./models")
-	v.SetDefault("models.default", "qwen2.5-0.5b-instruct-q8_0")
+	v.SetDefault("models.default", "qwen2.5-coder-3b-instruct-q8_0")
 	v.SetDefault("inference.num_ctx", 4096)
 	v.SetDefault("inference.num_thread", 0)
 	v.SetDefault("inference.num_gpu", 0)

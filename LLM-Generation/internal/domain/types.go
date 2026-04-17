@@ -111,3 +111,39 @@ type ProviderInfo struct {
 	IsDefault bool     `json:"is_default"`
 	Status    string   `json:"status"` // "healthy", "unhealthy", "unknown"
 }
+
+// --- Code-specific request/response types ---
+
+// CodeRequest is the unified request for all code operations.
+type CodeRequest struct {
+	// Code is the source code to analyze/explain/refactor/test/review.
+	Code string `json:"code,omitempty"`
+
+	// Language is the programming language (e.g. "go", "python", "java").
+	Language string `json:"language,omitempty"`
+
+	// Description is used for code generation — what the code should do.
+	Description string `json:"description,omitempty"`
+
+	// DiffOrComparison is used for code review — the diff or second version.
+	Diff string `json:"diff,omitempty"`
+
+	// TestFramework specifies which testing framework to use.
+	TestFramework string `json:"test_framework,omitempty"`
+
+	// Provider overrides the default LLM provider.
+	Provider string `json:"provider,omitempty"`
+
+	// Config provides runtime generation parameters.
+	Config *GenerateConfig `json:"config,omitempty"`
+}
+
+// CodeResponse is the response for code operations.
+type CodeResponse struct {
+	Result   string `json:"result"`             // Generated code, analysis, or explanation
+	Type     string `json:"type"`               // "analyze", "generate", "explain", "refactor", "test", "review"
+	Language string `json:"language,omitempty"` // Detected or specified language
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Usage    Usage  `json:"usage"`
+}

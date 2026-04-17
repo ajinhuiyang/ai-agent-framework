@@ -8,7 +8,7 @@ server:
 # Model storage
 models:
   dir: "./models"
-  default: "qwen2.5-0.5b-instruct-q8_0"
+  default: "qwen2.5-coder-3b-instruct-q8_0"
 
 # Default inference parameters
 inference:

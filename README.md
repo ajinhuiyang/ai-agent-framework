@@ -367,6 +367,162 @@ All dependencies are permissively licensed (MIT/Apache-2.0/BSD):
 
 GoInfer trades raw inference speed for portability and a complete application stack.
 
+## How to Call Each Service
+
+### Full Pipeline (recommended)
+
+Send a question to NLU, it automatically calls RAG and LLM-Generation, returns the final answer:
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/nlu/ask \
+  -H "Content-Type: application/json" \
+  -d '{"text": "What is Go?"}' | jq
+```
+
+### Call Services Individually
+
+**Local-LLM — chat directly with the model:**
+
+```bash
+curl -s -X POST http://localhost:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-1.5b-instruct-q8_0",
+    "stream": false,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+**NLU — analyze intent only (no generation):**
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/nlu/intent \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Book a flight to Shanghai"}'
+```
+
+**RAG — search the knowledge base:**
+
+```bash
+curl -s -X POST http://localhost:8081/api/v1/rag/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is Go?"}'
+```
+
+**LLM-Generation — generate with custom context:**
+
+```bash
+curl -s -X POST http://localhost:8082/api/v1/llm/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "What is Go?",
+    "provider": "ollama",
+    "context": [{"content": "Go was designed at Google in 2007.", "source": "wiki"}]
+  }'
+```
+
+### API Endpoint Reference
+
+| Service | Port | Method | Endpoint | Description |
+|---------|------|--------|----------|-------------|
+| NLU | 8080 | POST | `/api/v1/nlu/ask` | Full pipeline: NLU → RAG → LLM |
+| NLU | 8080 | POST | `/api/v1/nlu/intent` | Intent recognition |
+| NLU | 8080 | POST | `/api/v1/nlu/ner` | Entity extraction |
+| NLU | 8080 | POST | `/api/v1/nlu/sentiment` | Sentiment analysis |
+| NLU | 8080 | POST | `/api/v1/nlu/slot` | Slot filling |
+| NLU | 8080 | GET | `/health` | Health check |
+| RAG | 8081 | POST | `/api/v1/rag/ingest` | Ingest documents |
+| RAG | 8081 | POST | `/api/v1/rag/search` | Semantic search |
+| RAG | 8081 | GET | `/api/v1/rag/collections` | List collections |
+| LLM-Gen | 8082 | POST | `/api/v1/llm/generate` | Generate content |
+| LLM-Gen | 8082 | POST | `/api/v1/llm/conversations` | Create conversation |
+| LLM-Gen | 8082 | GET | `/api/v1/llm/providers` | List LLM providers |
+| Local-LLM | 11434 | POST | `/api/chat` | Chat completion |
+| Local-LLM | 11434 | POST | `/api/generate` | Text generation |
+| Local-LLM | 11434 | POST | `/api/embed` | Generate embeddings |
+| Local-LLM | 11434 | GET | `/api/tags` | List models |
+
+## How to Switch Models
+
+### Step 1: Download a new GGUF model
+
+Find models on [HuggingFace](https://huggingface.co) — search for the model name + "GGUF". Download the `.gguf` file into `Local-LLM/models/`:
+
+```bash
+# Example: switch to Qwen2.5-1.5B for better quality
+curl -L -o Local-LLM/models/qwen2.5-1.5b-instruct-q8_0.gguf \
+  https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q8_0.gguf
+```
+
+The filename (without `.gguf`) becomes the model name used in API calls.
+
+### Step 2: Update configuration
+
+Edit `Local-LLM/configs/config.yaml` — change `default` to the new model name:
+
+```yaml
+models:
+  dir: "./models"
+  default: "qwen2.5-1.5b-instruct-q8_0"   # ← change this
+```
+
+Also update `LLM-Generation/configs/config.yaml`:
+
+```yaml
+llm:
+  ollama:
+    model: "qwen2.5-1.5b-instruct-q8_0"   # ← match the model name
+```
+
+### Step 3: Restart services
+
+```bash
+# Restart Local-LLM (must restart to load the new model)
+# Ctrl+C the running process, then:
+cd Local-LLM && go run ./cmd/server
+
+# Restart LLM-Generation to pick up the new config
+cd LLM-Generation && go run ./cmd/server
+
+# NLU and RAG do not need to restart
+```
+
+### Step 4: Verify
+
+```bash
+# Check the model is loaded
+curl -s http://localhost:11434/api/tags | jq '.models[].name'
+
+# Test it
+curl -s -X POST http://localhost:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5-1.5b-instruct-q8_0","stream":false,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+### Recommended Models
+
+| Model | Size | Speed | Quality | Download |
+|-------|------|-------|---------|----------|
+| Qwen2.5-0.5B-Instruct Q8_0 | 640 MB | ~20 tok/s | Basic | `curl -L -o Local-LLM/models/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf` |
+| Qwen2.5-1.5B-Instruct Q8_0 | 1.8 GB | ~7 tok/s | Good | `curl -L -o Local-LLM/models/qwen2.5-1.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q8_0.gguf` |
+| Qwen2.5-3B-Instruct Q8_0 | 3.4 GB | ~3 tok/s | Better | `curl -L -o Local-LLM/models/qwen2.5-3b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q8_0.gguf` |
+
+### Using a Custom Model
+
+You can use any GGUF model from HuggingFace. The download URL pattern is:
+
+```
+https://huggingface.co/{org}/{repo}/resolve/main/{filename}.gguf
+```
+
+For example, to find Qwen models:
+1. Go to https://huggingface.co/Qwen
+2. Search for the model with "GGUF" in the name
+3. Click the `.gguf` file and copy the download URL
+4. Download and place in `Local-LLM/models/`
+
+> **Tip:** Choose Q8_0 quantization for the best balance of size and quality. Q4_0 is smaller but lower quality.
+
 ## License
 
 MIT

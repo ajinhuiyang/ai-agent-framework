@@ -57,6 +57,16 @@ curl -s http://localhost:8080/api/v1/nlu/ask \
   - [全链路流程](#全链路流程)
 - [依赖库](#依赖库)
 - [与 Ollama 的对比](#与-ollama-的对比)
+- [如何请求各服务](#如何请求各服务)
+  - [全链路调用](#全链路调用推荐)
+  - [单独调用各服务](#单独调用各服务)
+  - [API 端点速查表](#api-端点速查表)
+- [如何更换模型](#如何更换模型)
+  - [下载模型](#第一步下载新的-gguf-模型)
+  - [修改配置](#第二步修改配置)
+  - [重启服务](#第三步重启服务)
+  - [验证](#第四步验证)
+  - [推荐模型](#推荐模型及下载命令)
 - [许可证](#许可证)
 
 ---
@@ -524,6 +534,168 @@ GGUF 模型文件
 | 生产就绪 | 实验性 | 是 |
 
 GoInfer 用推理速度换取了可移植性和完整的应用栈。
+
+---
+
+## 如何请求各服务
+
+### 全链路调用（推荐）
+
+向 NLU 发送一个问题，它自动编排 RAG 检索 + LLM 生成，返回最终回答：
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/nlu/ask \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Go语言是什么？"}' | jq
+```
+
+### 单独调用各服务
+
+**Local-LLM —— 直接和模型对话：**
+
+```bash
+curl -s -X POST http://localhost:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-1.5b-instruct-q8_0",
+    "stream": false,
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
+```
+
+**NLU —— 仅分析意图（不生成回答）：**
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/nlu/intent \
+  -H "Content-Type: application/json" \
+  -d '{"text": "帮我订一张去上海的机票"}'
+```
+
+**RAG —— 搜索知识库：**
+
+```bash
+curl -s -X POST http://localhost:8081/api/v1/rag/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Go语言是什么？"}'
+```
+
+**LLM-Generation —— 带上下文生成：**
+
+```bash
+curl -s -X POST http://localhost:8082/api/v1/llm/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Go语言是什么？",
+    "provider": "ollama",
+    "context": [{"content": "Go 由 Google 于 2007 年设计。", "source": "wiki"}]
+  }'
+```
+
+### API 端点速查表
+
+| 服务 | 端口 | 方法 | 端点 | 说明 |
+|------|------|------|------|------|
+| NLU | 8080 | POST | `/api/v1/nlu/ask` | 全链路：NLU → RAG → LLM |
+| NLU | 8080 | POST | `/api/v1/nlu/intent` | 意图识别 |
+| NLU | 8080 | POST | `/api/v1/nlu/ner` | 实体抽取 |
+| NLU | 8080 | POST | `/api/v1/nlu/sentiment` | 情感分析 |
+| NLU | 8080 | POST | `/api/v1/nlu/slot` | 槽位填充 |
+| NLU | 8080 | GET | `/health` | 健康检查 |
+| RAG | 8081 | POST | `/api/v1/rag/ingest` | 摄入文档 |
+| RAG | 8081 | POST | `/api/v1/rag/search` | 语义搜索 |
+| RAG | 8081 | GET | `/api/v1/rag/collections` | 列出集合 |
+| LLM-Gen | 8082 | POST | `/api/v1/llm/generate` | 生成内容 |
+| LLM-Gen | 8082 | POST | `/api/v1/llm/conversations` | 创建会话 |
+| LLM-Gen | 8082 | GET | `/api/v1/llm/providers` | 列出可用后端 |
+| Local-LLM | 11434 | POST | `/api/chat` | 对话补全 |
+| Local-LLM | 11434 | POST | `/api/generate` | 文本生成 |
+| Local-LLM | 11434 | POST | `/api/embed` | 生成向量 |
+| Local-LLM | 11434 | GET | `/api/tags` | 列出模型 |
+
+---
+
+## 如何更换模型
+
+### 第一步：下载新的 GGUF 模型
+
+在 [HuggingFace](https://huggingface.co) 上搜索模型名 + "GGUF"，下载 `.gguf` 文件到 `Local-LLM/models/` 目录：
+
+```bash
+# 示例：切换到 Qwen2.5-1.5B 以获得更好的回答质量
+curl -L -o Local-LLM/models/qwen2.5-1.5b-instruct-q8_0.gguf \
+  https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q8_0.gguf
+```
+
+文件名（去掉 `.gguf` 后缀）就是 API 调用时使用的模型名。
+
+### 第二步：修改配置
+
+编辑 `Local-LLM/configs/config.yaml`，将 `default` 改为新模型名：
+
+```yaml
+models:
+  dir: "./models"
+  default: "qwen2.5-1.5b-instruct-q8_0"   # ← 改这里
+```
+
+同时编辑 `LLM-Generation/configs/config.yaml`：
+
+```yaml
+llm:
+  ollama:
+    model: "qwen2.5-1.5b-instruct-q8_0"   # ← 与模型名保持一致
+```
+
+### 第三步：重启服务
+
+```bash
+# 重启 Local-LLM（必须重启才能加载新模型）
+# 在运行的终端按 Ctrl+C 停止，然后重新启动：
+cd Local-LLM && go run ./cmd/server
+
+# 重启 LLM-Generation 使其读取新配置
+cd LLM-Generation && go run ./cmd/server
+
+# NLU 和 RAG 不需要重启
+```
+
+### 第四步：验证
+
+```bash
+# 检查模型是否加载成功
+curl -s http://localhost:11434/api/tags | jq '.models[].name'
+
+# 测试对话
+curl -s -X POST http://localhost:11434/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen2.5-1.5b-instruct-q8_0","stream":false,"messages":[{"role":"user","content":"你好"}]}'
+```
+
+### 推荐模型及下载命令
+
+| 模型 | 大小 | 速度 | 质量 | 下载命令 |
+|------|------|------|------|---------|
+| Qwen2.5-0.5B-Instruct Q8_0 | 640 MB | ~20 tok/s | 基础 | `curl -L -o Local-LLM/models/qwen2.5-0.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q8_0.gguf` |
+| Qwen2.5-1.5B-Instruct Q8_0 | 1.8 GB | ~7 tok/s | 良好 | `curl -L -o Local-LLM/models/qwen2.5-1.5b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q8_0.gguf` |
+| Qwen2.5-3B-Instruct Q8_0 | 3.4 GB | ~3 tok/s | 更好 | `curl -L -o Local-LLM/models/qwen2.5-3b-instruct-q8_0.gguf https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q8_0.gguf` |
+
+### 使用其他模型
+
+你可以使用 HuggingFace 上任何 GGUF 格式的模型。下载链接的通用格式为：
+
+```
+https://huggingface.co/{组织名}/{仓库名}/resolve/main/{文件名}.gguf
+```
+
+查找步骤：
+1. 打开 https://huggingface.co
+2. 搜索模型名 + "GGUF"（如 "Qwen2.5 1.5B GGUF"）
+3. 进入仓库，点击 `.gguf` 文件，复制下载链接
+4. 下载后放入 `Local-LLM/models/` 目录
+5. 修改配置文件中的 `default` 和 `model` 字段
+6. 重启 Local-LLM 和 LLM-Generation
+
+> **提示：** 建议选择 Q8_0 量化版本，在文件大小和质量之间有最好的平衡。Q4_0 更小但质量略差。
 
 ---
 

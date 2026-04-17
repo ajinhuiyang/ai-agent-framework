@@ -106,15 +106,15 @@ type Engine struct {
 // inferBuffers holds pre-allocated scratch space for a single forward pass.
 type inferBuffers struct {
 	x       []float32 // [hidden] current hidden state
-	normed  []float32 // [hidden] normalized hidden state
+	normed  []float32 // [max_seq*hidden] normalized hidden state
 	q       []float32 // [hidden] query projection
 	k       []float32 // [kv_dim] key projection
 	v       []float32 // [kv_dim] value projection
-	attnOut []float32 // [hidden] attention output
+	attnOut []float32 // [max_seq*hidden] attention output scratch
 	proj    []float32 // [hidden] output projection scratch
 	gate    []float32 // [intermediate] FFN gate
 	up      []float32 // [intermediate] FFN up
-	ffnOut  []float32 // [hidden] FFN output
+	ffnOut  []float32 // [max_seq*hidden] FFN output scratch
 	logits  []float32 // [vocab] output logits
 	scores  []float32 // [max_seq_len] attention scores scratch
 }
@@ -259,17 +259,18 @@ func (e *Engine) Load(ctx context.Context, modelPath string, opts engine.LoadOpt
 
 	// Pre-allocate inference buffers.
 	kvDimBuf := cfg.NumKVHeads * cfg.HeadDim
+	maxBuf := cfg.MaxSeqLen * cfg.HiddenSize
 	e.buffers = &inferBuffers{
 		x:       make([]float32, cfg.HiddenSize),
-		normed:  make([]float32, cfg.HiddenSize),
+		normed:  make([]float32, maxBuf),
 		q:       make([]float32, cfg.HiddenSize),
 		k:       make([]float32, kvDimBuf),
 		v:       make([]float32, kvDimBuf),
-		attnOut: make([]float32, cfg.HiddenSize),
+		attnOut: make([]float32, maxBuf),
 		proj:    make([]float32, cfg.HiddenSize),
 		gate:    make([]float32, cfg.IntermediateSize),
 		up:      make([]float32, cfg.IntermediateSize),
-		ffnOut:  make([]float32, cfg.HiddenSize),
+		ffnOut:  make([]float32, maxBuf),
 		logits:  make([]float32, cfg.VocabSize),
 		scores:  make([]float32, cfg.MaxSeqLen),
 	}
@@ -529,8 +530,8 @@ func (e *Engine) transformerLayer(x []float32, seqLen, layer int) []float32 {
 	lw := &e.weights.Layers[layer]
 
 	// 1. Pre-attention RMSNorm.
-	normed := make([]float32, len(x))
-	copy(normed, x)
+	normed := make([]float32, seqLen*hidden)
+	copy(normed, x[:seqLen*hidden])
 	for i := 0; i < seqLen; i++ {
 		rmsNorm(normed[i*hidden:(i+1)*hidden], lw.AttnNorm, cfg.RMSNormEps)
 	}
@@ -539,13 +540,13 @@ func (e *Engine) transformerLayer(x []float32, seqLen, layer int) []float32 {
 	attnOut := e.selfAttention(normed, seqLen, layer)
 
 	// 3. Residual connection.
-	for i := range x {
+	for i := 0; i < seqLen*hidden; i++ {
 		x[i] += attnOut[i]
 	}
 
 	// 4. Pre-FFN RMSNorm.
-	normed2 := make([]float32, len(x))
-	copy(normed2, x)
+	normed2 := make([]float32, seqLen*hidden)
+	copy(normed2, x[:seqLen*hidden])
 	for i := 0; i < seqLen; i++ {
 		rmsNorm(normed2[i*hidden:(i+1)*hidden], lw.FFNNorm, cfg.RMSNormEps)
 	}
@@ -554,7 +555,7 @@ func (e *Engine) transformerLayer(x []float32, seqLen, layer int) []float32 {
 	ffnOut := e.feedForward(normed2, seqLen, layer)
 
 	// 6. Residual connection.
-	for i := range x {
+	for i := 0; i < seqLen*hidden; i++ {
 		x[i] += ffnOut[i]
 	}
 
@@ -624,15 +625,13 @@ func (e *Engine) selfAttention(x []float32, seqLen, layer int) []float32 {
 		// Compute attention for each query head.
 		cachedLen := kvc.Len
 		headsPerKVGroup := numHeads / numKVHeads
+		scale := float32(1.0 / math.Sqrt(float64(headDim)))
 
 		for h := 0; h < numHeads; h++ {
 			kvHead := h / headsPerKVGroup
 			qHead := q[h*headDim : (h+1)*headDim]
 
-			// Compute attention scores.
-			scores := make([]float32, cachedLen)
-			scale := float32(1.0 / math.Sqrt(float64(headDim)))
-
+			scores := e.buffers.scores[:cachedLen]
 			for t := 0; t < cachedLen; t++ {
 				kHead := kvc.K[t*kvDim+kvHead*headDim : t*kvDim+(kvHead+1)*headDim]
 				var dot float32
@@ -642,13 +641,8 @@ func (e *Engine) selfAttention(x []float32, seqLen, layer int) []float32 {
 				scores[t] = dot * scale
 			}
 
-			// Causal mask: current position can attend to all cached positions.
-			// (Already correct since we only have positions <= absPos in cache.)
-
-			// Softmax.
 			softmax(scores)
 
-			// Weighted sum of values.
 			for t := 0; t < cachedLen; t++ {
 				vHead := kvc.V[t*kvDim+kvHead*headDim : t*kvDim+(kvHead+1)*headDim]
 				for d := 0; d < headDim; d++ {
@@ -690,28 +684,22 @@ func (e *Engine) feedForward(x []float32, seqLen, layer int) []float32 {
 			up[i] = 0
 		}
 
-		// Gate and Up projections — run in parallel using two halves of worker pool.
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			matVecMulChunk(up, lw.WUp, xPos, 0, inter, hidden)
-		}()
-		matVecMulChunk(gate, lw.WGate, xPos, 0, inter, hidden)
-		wg.Wait()
+		// Gate and Up projections — both use full worker pool, sequential.
+		e.matVecMulPooled(gate, lw.WGate, xPos, inter, hidden)
+		e.matVecMulPooled(up, lw.WUp, xPos, inter, hidden)
 
 		// SwiGLU activation: silu(gate) * up
 		for i := 0; i < inter; i++ {
 			gate[i] = silu(gate[i]) * up[i]
 		}
 
-		// Down projection.
-		ffnOut := e.buffers.ffnOut
-		for i := range ffnOut {
-			ffnOut[i] = 0
+		// Down projection — use x buffer as scratch (safe: we copy to out).
+		downOut := e.buffers.x
+		for i := range downOut {
+			downOut[i] = 0
 		}
-		e.matVecMulPooled(ffnOut, lw.WDown, gate, hidden, inter)
-		copy(out[pos*hidden:], ffnOut)
+		e.matVecMulPooled(downOut, lw.WDown, gate, hidden, inter)
+		copy(out[pos*hidden:], downOut)
 	}
 
 	return out
@@ -734,7 +722,7 @@ func (e *Engine) resetCache() {
 // matVecMul computes out = mat * vec, where mat is [rows, cols] row-major.
 // Dispatches to worker pool for large matrices.
 func (e *Engine) matVecMulPooled(out, mat, vec []float32, rows, cols int) {
-	if rows < 256 {
+	if rows < 512 {
 		matVecMulChunk(out, mat, vec, 0, rows, cols)
 		return
 	}
@@ -742,18 +730,18 @@ func (e *Engine) matVecMulPooled(out, mat, vec []float32, rows, cols int) {
 }
 
 // matVecMulChunk computes a chunk of rows for matVecMul.
-// Uses 8x unrolling and accumulator splitting for better ILP.
+// Uses 16x unrolling and 4-way accumulator splitting for better ILP.
 func matVecMulChunk(out, mat, vec []float32, startRow, endRow, cols int) {
 	for i := startRow; i < endRow; i++ {
 		var s0, s1, s2, s3 float32
 		rowOff := i * cols
 		row := mat[rowOff : rowOff+cols]
 		j := 0
-		for ; j+7 < cols; j += 8 {
-			s0 += row[j]*vec[j] + row[j+1]*vec[j+1]
-			s1 += row[j+2]*vec[j+2] + row[j+3]*vec[j+3]
-			s2 += row[j+4]*vec[j+4] + row[j+5]*vec[j+5]
-			s3 += row[j+6]*vec[j+6] + row[j+7]*vec[j+7]
+		for ; j+15 < cols; j += 16 {
+			s0 += row[j]*vec[j] + row[j+1]*vec[j+1] + row[j+2]*vec[j+2] + row[j+3]*vec[j+3]
+			s1 += row[j+4]*vec[j+4] + row[j+5]*vec[j+5] + row[j+6]*vec[j+6] + row[j+7]*vec[j+7]
+			s2 += row[j+8]*vec[j+8] + row[j+9]*vec[j+9] + row[j+10]*vec[j+10] + row[j+11]*vec[j+11]
+			s3 += row[j+12]*vec[j+12] + row[j+13]*vec[j+13] + row[j+14]*vec[j+14] + row[j+15]*vec[j+15]
 		}
 		for ; j < cols; j++ {
 			s0 += row[j] * vec[j]
