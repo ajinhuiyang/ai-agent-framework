@@ -67,6 +67,36 @@ type ConversationConfig struct {
 type PromptConfig struct {
 	DefaultSystem string `mapstructure:"default_system"`
 	RAGSystem     string `mapstructure:"rag_system"`
+	CodeAnalyze   string `mapstructure:"code_analyze"`
+	CodeGenerate  string `mapstructure:"code_generate"`
+	CodeExplain   string `mapstructure:"code_explain"`
+	CodeRefactor  string `mapstructure:"code_refactor"`
+	CodeTest      string `mapstructure:"code_test"`
+	CodeReview    string `mapstructure:"code_review"`
+}
+
+// TemplateMap returns all named prompt templates as a map.
+func (p PromptConfig) TemplateMap() map[string]string {
+	m := make(map[string]string)
+	if p.CodeAnalyze != "" {
+		m["code_analyze"] = p.CodeAnalyze
+	}
+	if p.CodeGenerate != "" {
+		m["code_generate"] = p.CodeGenerate
+	}
+	if p.CodeExplain != "" {
+		m["code_explain"] = p.CodeExplain
+	}
+	if p.CodeRefactor != "" {
+		m["code_refactor"] = p.CodeRefactor
+	}
+	if p.CodeTest != "" {
+		m["code_test"] = p.CodeTest
+	}
+	if p.CodeReview != "" {
+		m["code_review"] = p.CodeReview
+	}
+	return m
 }
 
 type LoggingConfig struct {
@@ -84,13 +114,14 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("server.read_timeout", 60)
 	v.SetDefault("server.write_timeout", 120)
 	v.SetDefault("server.mode", "debug")
-	v.SetDefault("llm.default_provider", "ollama")
+	v.SetDefault("llm.default_provider", "openai")
 	v.SetDefault("llm.temperature", 0.7)
 	v.SetDefault("llm.max_tokens", 4096)
+	v.SetDefault("llm.openai.api_key", "not-needed")
 	v.SetDefault("llm.openai.base_url", "http://localhost:11434/v1")
-	v.SetDefault("llm.openai.model", "qwen2.5-coder-3b-instruct-q8_0")
+	v.SetDefault("llm.openai.model", "Qwen2.5-Coder-7B-Instruct-Q4_K_M")
 	v.SetDefault("llm.ollama.base_url", "http://localhost:11434")
-	v.SetDefault("llm.ollama.model", "qwen2.5-coder-3b-instruct-q8_0")
+	v.SetDefault("llm.ollama.model", "qwen2.5-coder:7b-instruct-q4_K_M")
 	v.SetDefault("conversation.max_turns", 50)
 	v.SetDefault("conversation.expire_minutes", 60)
 	v.SetDefault("conversation.max_sessions", 10000)

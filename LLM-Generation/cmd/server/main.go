@@ -101,8 +101,8 @@ func main() {
 		log.Fatal("no LLM providers configured")
 	}
 
-	// Create prompt manager.
-	promptMgr := prompt.New(cfg.Prompt.DefaultSystem, cfg.Prompt.RAGSystem)
+	// Create prompt manager with all templates from config.
+	promptMgr := prompt.New(cfg.Prompt.DefaultSystem, cfg.Prompt.RAGSystem, cfg.Prompt.TemplateMap())
 
 	// Create orchestrator.
 	defaultConfig := domain.GenerateConfig{
@@ -120,7 +120,7 @@ func main() {
 	)
 
 	// Create HTTP handler and router.
-	h := handler.New(orch, logger)
+	h := handler.New(orch, promptMgr, logger)
 
 	gin.SetMode(cfg.Server.Mode)
 	router := api.NewRouter(h, logger)

@@ -11,17 +11,19 @@ import (
 
 	"github.com/your-org/llm-generation/internal/domain"
 	"github.com/your-org/llm-generation/internal/orchestrator"
+	"github.com/your-org/llm-generation/internal/prompt"
 )
 
 // Handler handles HTTP requests for the LLM Generation service.
 type Handler struct {
-	orch   *orchestrator.Orchestrator
-	logger *zap.Logger
+	orch      *orchestrator.Orchestrator
+	promptMgr *prompt.Manager
+	logger    *zap.Logger
 }
 
 // New creates a new Handler.
-func New(orch *orchestrator.Orchestrator, logger *zap.Logger) *Handler {
-	return &Handler{orch: orch, logger: logger}
+func New(orch *orchestrator.Orchestrator, promptMgr *prompt.Manager, logger *zap.Logger) *Handler {
+	return &Handler{orch: orch, promptMgr: promptMgr, logger: logger}
 }
 
 // APIResponse is the standard response envelope.
@@ -251,9 +253,11 @@ func (h *Handler) handleCode(c *gin.Context, codeType, systemPromptKey string) {
 	}
 
 	// Generate using the orchestrator with the appropriate system prompt.
+	// Resolve the template key to actual prompt content.
+	systemPrompt := h.promptMgr.ResolveTemplate(systemPromptKey)
 	genReq := domain.GenerateRequest{
 		Prompt:       userPrompt,
-		SystemPrompt: systemPromptKey, // Orchestrator/prompt manager resolves this
+		SystemPrompt: systemPrompt,
 		Provider:     req.Provider,
 		Config:       req.Config,
 	}

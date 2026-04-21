@@ -13,11 +13,13 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"gopkg.in/yaml.v3"
 
 	"github.com/your-org/nlu/internal/api"
 	"github.com/your-org/nlu/internal/api/handler"
 	"github.com/your-org/nlu/internal/client"
 	"github.com/your-org/nlu/internal/config"
+	"github.com/your-org/nlu/internal/domain"
 	"github.com/your-org/nlu/internal/llm"
 	llmollama "github.com/your-org/nlu/internal/llm/ollama"
 	llmopenai "github.com/your-org/nlu/internal/llm/openai"
@@ -66,6 +68,34 @@ func main() {
 	// Initialize prompt manager
 	promptManager := prompt.NewManager()
 
+	// Load domain schema from domain.yaml
+	var domainSchema *domain.DomainSchema
+	if cfg.NLU.DomainSchemaPath != "" {
+		schemaData, err := os.ReadFile(cfg.NLU.DomainSchemaPath)
+		if err != nil {
+			logger.Warn("failed to read domain schema file, pipeline will use defaults",
+				zap.String("path", cfg.NLU.DomainSchemaPath),
+				zap.Error(err),
+			)
+		} else {
+			var schema domain.DomainSchema
+			if err := yaml.Unmarshal(schemaData, &schema); err != nil {
+				logger.Warn("failed to parse domain schema, pipeline will use defaults",
+					zap.Error(err),
+				)
+			} else {
+				domainSchema = &schema
+				logger.Info("domain schema loaded",
+					zap.String("name", schema.Name),
+					zap.Int("intents", len(schema.Intents)),
+					zap.Int("entity_types", len(schema.EntityTypes)),
+					zap.Int("slot_definitions", len(schema.SlotDefinitions)),
+					zap.Int("categories", len(schema.Categories)),
+				)
+			}
+		}
+	}
+
 	// Initialize NLU modules
 	intentRecognizer := intent.New(provider, promptManager, logger)
 	nerExtractor := ner.New(provider, promptManager, logger)
@@ -82,6 +112,7 @@ func main() {
 		SentimentAnalyzer: sentimentAnalyzer,
 		TextClassifier:    textClassifier,
 		DialogManager:     dialogManager,
+		Schema:            domainSchema,
 		Logger:            logger,
 		DefaultCaps:       cfg.NLU.DefaultCapabilities,
 	})

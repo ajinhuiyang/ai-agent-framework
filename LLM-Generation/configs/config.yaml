@@ -1,34 +1,39 @@
+# LLM Generation Service Configuration
+#
+# Architecture: NLU(:8080) → RAG(:8081) → LLM-Generation(:8082) → Local-LLM(:11434)
+# Local-LLM (C++) provides OpenAI-compatible /v1/chat/completions API.
+
 server:
   host: "0.0.0.0"
   port: 8082
-  read_timeout: 60
-  write_timeout: 120
+  read_timeout: 600
+  write_timeout: 600
   mode: "debug"  # debug, release, test
 
 # Default LLM provider
 llm:
-  default_provider: "ollama"
+  default_provider: "openai"  # Use "openai" to route to Local-LLM
   temperature: 0.7
   max_tokens: 4096
 
-  # OpenAI / OpenAI-compatible (also works for Ollama, vLLM, etc.)
+  # OpenAI-compatible → points to Local-LLM (C++)
   openai:
-    api_key: ""
+    api_key: "not-needed"  # Local-LLM doesn't require an API key
     base_url: "http://localhost:11434/v1"
-    model: "qwen2.5-coder-0.5b-q8_0"
+    model: "Qwen2.5-Coder-7B-Instruct-Q4_K_M"
 
-  # Ollama native API
+  # Ollama native API (backup/alternative)
   ollama:
     base_url: "http://localhost:11434"
-    model: "qwen2.5-coder-3b-instruct-q8_0"
+    model: "qwen2.5-coder:7b-instruct-q4_K_M"
 
-  # ZhipuAI (智谱清言 GLM)
+  # ZhipuAI (智谱清言 GLM) — optional cloud provider
   zhipu:
     api_key: ""
     base_url: "https://open.bigmodel.cn/api/paas/v4"
     model: "glm-4-flash"
 
-  # Qwen (通义千问 DashScope)
+  # Qwen (通义千问 DashScope) — optional cloud provider
   qwen:
     api_key: ""
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"

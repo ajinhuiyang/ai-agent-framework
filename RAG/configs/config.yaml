@@ -1,13 +1,22 @@
+# RAG Service Configuration
+#
+# Architecture: NLU(:8080) → RAG(:8081) → LLM-Generation(:8082) → Local-LLM(:11434)
+#
+# IMPORTANT: RAG requires an embedding model. Local-LLM (C++) does NOT support
+# /v1/embeddings, so we use Ollama with nomic-embed-text for embedding.
+# Make sure Ollama is running: ollama serve && ollama pull nomic-embed-text
+
 server:
   host: "0.0.0.0"
   port: 8081
-  read_timeout: 30
-  write_timeout: 30
+  read_timeout: 600
+  write_timeout: 600
   mode: "debug"  # debug, release, test
 
 # Embedding provider for vectorization
+# Uses Ollama because Local-LLM only supports chat/completions, not embeddings.
 embedding:
-  provider: "ollama"  # openai, ollama, local
+  provider: "ollama"  # openai, ollama
   openai:
     api_key: ""
     base_url: "http://localhost:11434/v1"  # Ollama OpenAI-compatible endpoint

@@ -14,17 +14,32 @@ import (
 type Manager struct {
 	defaultSystem string
 	ragSystem     string
+	templates     map[string]string // named templates (code_analyze, code_generate, etc.)
 }
 
 // New creates a new prompt Manager.
-func New(defaultSystem, ragSystem string) *Manager {
+func New(defaultSystem, ragSystem string, templates map[string]string) *Manager {
 	if defaultSystem == "" {
 		defaultSystem = "You are a helpful, accurate, and concise AI assistant."
+	}
+	if templates == nil {
+		templates = make(map[string]string)
 	}
 	return &Manager{
 		defaultSystem: defaultSystem,
 		ragSystem:     ragSystem,
+		templates:     templates,
 	}
+}
+
+// ResolveTemplate looks up a named template. If the key matches a registered
+// template name, returns the template content. Otherwise returns the key as-is
+// (treating it as a literal system prompt).
+func (m *Manager) ResolveTemplate(key string) string {
+	if tmpl, ok := m.templates[key]; ok {
+		return tmpl
+	}
+	return key
 }
 
 // BuildMessages constructs the full message list for a generation request.

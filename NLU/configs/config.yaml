@@ -1,30 +1,33 @@
 # NLU Microservice Configuration
+#
+# Architecture: NLU(:8080) → RAG(:8081) → LLM-Generation(:8082) → Local-LLM(:11434)
+# Local-LLM (C++) provides OpenAI-compatible /v1/chat/completions API.
 
 server:
   host: "0.0.0.0"
   port: 8080
-  read_timeout: 30   # seconds
-  write_timeout: 30  # seconds
-  mode: "debug"      # "debug", "release", "test"
+  read_timeout: 600   # seconds (LLM inference can be slow)
+  write_timeout: 600  # seconds
+  mode: "debug"       # "debug", "release", "test"
 
 llm:
-  provider: "ollama"  # "openai" or "ollama"
+  provider: "openai"  # "openai" to use Local-LLM via OpenAI-compatible API
   temperature: 0.1
   max_tokens: 2048
   max_retries: 3
-  timeout: 60  # seconds
+  timeout: 600  # seconds (local model inference may take time)
 
-  # OpenAI-compatible API (works with Ollama, vLLM, etc.)
+  # OpenAI-compatible API → points to Local-LLM (C++)
   openai:
-    api_key: ""  # Set via NLU_LLM_OPENAI_API_KEY env var
-    base_url: "http://localhost:11434/v1"  # Ollama's OpenAI-compatible endpoint
-    model: "qwen2.5-coder-0.5b-q8_0"
+    api_key: "not-needed"  # Local-LLM doesn't require an API key
+    base_url: "http://localhost:11434/v1"  # Local-LLM C++ OpenAI-compatible endpoint
+    model: "Qwen2.5-Coder-7B-Instruct-Q4_K_M"
     org_id: ""
 
-  # Native Ollama API
+  # Native Ollama API (backup/alternative)
   ollama:
     base_url: "http://localhost:11434"
-    model: "qwen2.5-coder-0.5b-q8_0"
+    model: "qwen2.5-coder:7b-instruct-q4_K_M"
 
 nlu:
   default_capabilities:
@@ -38,14 +41,14 @@ nlu:
   cache_ttl: 300  # seconds
 
 logging:
-  level: "info"    # "debug", "info", "warn", "error"
-  format: "json"   # "json", "console"
+  level: "info"     # "debug", "info", "warn", "error"
+  format: "console" # "json", "console"
 
 # Peer service endpoints
 services:
   rag:
     base_url: "http://localhost:8081"
-    timeout: 30  # seconds
+    timeout: 600  # seconds
   llm_generation:
     base_url: "http://localhost:8082"
-    timeout: 120  # seconds
+    timeout: 600  # seconds

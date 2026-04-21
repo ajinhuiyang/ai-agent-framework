@@ -28,7 +28,7 @@ func setupTestRouter() *gin.Engine {
 		DefaultCaps: []string{"intent", "ner", "sentiment"},
 	})
 
-	h := handler.NewNLUHandler(engine, dm, logger)
+	h := handler.NewNLUHandler(engine, dm, nil, nil, logger)
 
 	r := gin.New()
 	r.GET("/health", h.HealthCheck)

@@ -124,16 +124,17 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.write_timeout", 600)
 	v.SetDefault("server.mode", "debug")
 
-	// LLM
-	v.SetDefault("llm.provider", "ollama")
+	// LLM — defaults point to Local-LLM C++ on port 11434
+	v.SetDefault("llm.provider", "openai")
 	v.SetDefault("llm.max_retries", 3)
 	v.SetDefault("llm.timeout", 600)
 	v.SetDefault("llm.temperature", 0.1)
 	v.SetDefault("llm.max_tokens", 2048)
+	v.SetDefault("llm.openai.api_key", "not-needed")
 	v.SetDefault("llm.openai.base_url", "http://localhost:11434/v1")
-	v.SetDefault("llm.openai.model", "qwen2.5-coder-3b-instruct-q8_0")
+	v.SetDefault("llm.openai.model", "Qwen2.5-Coder-7B-Instruct-Q4_K_M")
 	v.SetDefault("llm.ollama.base_url", "http://localhost:11434")
-	v.SetDefault("llm.ollama.model", "qwen2.5-coder-3b-instruct-q8_0")
+	v.SetDefault("llm.ollama.model", "qwen2.5-coder:7b-instruct-q4_K_M")
 
 	// NLU
 	v.SetDefault("nlu.default_capabilities", []string{"intent", "ner", "sentiment"})
