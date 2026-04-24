@@ -12,7 +12,7 @@ models:
 
 # Default inference parameters
 inference:
-  num_ctx: 2048        # Reduce context to save memory for 7B model
+  num_ctx: 4096        # Context window size (matches C++ engine)
   num_thread: 0        # 0 = auto-detect (runtime.NumCPU)
   num_gpu: 0           # GPU layers to offload (0 = CPU only)
   batch_size: 256      # Smaller batch for memory efficiency
@@ -22,8 +22,8 @@ sampling:
   temperature: 0.7
   top_p: 0.9
   top_k: 40
-  repeat_penalty: 1.1
-  num_predict: 256     # Limit output length for faster response
+  repeat_penalty: 1.3
+  num_predict: 2048    # 代码生成需要足够的 token 预算
   seed: -1
 
 logging:

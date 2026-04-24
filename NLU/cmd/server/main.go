@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -60,10 +61,45 @@ func main() {
 	// Load domain schema from domain.yaml
 	var domainSchema *domain.DomainSchema
 	if cfg.NLU.DomainSchemaPath != "" {
-		schemaData, err := os.ReadFile(cfg.NLU.DomainSchemaPath)
+		schemaPath := cfg.NLU.DomainSchemaPath
+
+		// Log current working directory for debugging path issues
+		if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+			logger.Info("current working directory", zap.String("cwd", cwd))
+		}
+
+		schemaData, err := os.ReadFile(schemaPath)
 		if err != nil {
-			logger.Warn("failed to read domain schema file, pipeline will use defaults",
-				zap.String("path", cfg.NLU.DomainSchemaPath),
+			// Try multiple fallback paths
+			candidates := []string{}
+
+			// 1. Relative to executable directory
+			if exePath, exeErr := os.Executable(); exeErr == nil {
+				candidates = append(candidates, filepath.Join(filepath.Dir(exePath), schemaPath))
+			}
+
+			// 2. Common relative paths from various working directories
+			candidates = append(candidates,
+				filepath.Join("configs", "domain.yaml"),
+				filepath.Join("..", "configs", "domain.yaml"),
+				filepath.Join("..", "..", "configs", "domain.yaml"), // cwd = cmd/server/
+				filepath.Join("NLU", "configs", "domain.yaml"),
+			)
+
+			for _, alt := range candidates {
+				if altData, altErr := os.ReadFile(alt); altErr == nil {
+					schemaData = altData
+					schemaPath = alt
+					err = nil
+					logger.Info("found domain schema at fallback path", zap.String("path", alt))
+					break
+				}
+			}
+		}
+
+		if err != nil {
+			logger.Error("failed to read domain schema file — intent recognition will NOT work",
+				zap.String("configured_path", cfg.NLU.DomainSchemaPath),
 				zap.Error(err),
 			)
 		} else {

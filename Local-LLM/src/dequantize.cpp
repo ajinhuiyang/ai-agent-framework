@@ -15,6 +15,11 @@ namespace localllm {
 // ======================== F16 <-> F32 转换 ========================
 
 float f16_to_f32(uint16_t h) {
+#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE)
+    __fp16 f16;
+    memcpy(&f16, &h, sizeof(f16));
+    return (float)f16;
+#else
     uint32_t sign = (uint32_t)(h & 0x8000) << 16;
     uint32_t exponent = (h >> 10) & 0x1F;
     uint32_t mantissa = h & 0x03FF;
@@ -49,6 +54,7 @@ float f16_to_f32(uint16_t h) {
     float f;
     memcpy(&f, &result, 4);
     return f;
+#endif
 }
 
 uint16_t f32_to_f16(float f) {
@@ -723,6 +729,31 @@ float vec_dot_q8_0(const void* src, const float* y, int64_t n) {
     const int nb = n / 32;
     float sumf = 0.0f;
 
+#ifdef USE_NEON
+    float32x4_t acc_total = vdupq_n_f32(0.0f);
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const int8_t* qs = x[i].qs;
+        const float* yb = y + i * 32;
+
+        // Process 32 elements in chunks of 8 using NEON
+        for (int j = 0; j < 32; j += 8) {
+            // Load 8 int8 values, widen to int16, then int32
+            int8x8_t vq = vld1_s8(qs + j);
+            int16x8_t vq16 = vmovl_s8(vq);
+
+            // Load 8 float values and convert to int (approximate for dot product)
+            // Better: accumulate float directly
+            float32x4_t vy0 = vld1q_f32(yb + j);
+            float32x4_t vy1 = vld1q_f32(yb + j + 4);
+            float32x4_t vq_f32_0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vq16)));
+            float32x4_t vq_f32_1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vq16)));
+            acc_total = vfmaq_f32(acc_total, vmulq_n_f32(vq_f32_0, d), vy0);
+            acc_total = vfmaq_f32(acc_total, vmulq_n_f32(vq_f32_1, d), vy1);
+        }
+    }
+    sumf = vaddvq_f32(acc_total);
+#else
     for (int i = 0; i < nb; i++) {
         const float d = f16_to_f32(x[i].d);
         float s = 0.0f;
@@ -731,6 +762,7 @@ float vec_dot_q8_0(const void* src, const float* y, int64_t n) {
         }
         sumf += d * s;
     }
+#endif
     return sumf;
 }
 

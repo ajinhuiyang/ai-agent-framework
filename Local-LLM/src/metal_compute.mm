@@ -30,6 +30,9 @@ struct MetalContext::Impl {
     int64_t x_buf_size   = 0;
     int64_t y_buf_size   = 0;
 
+    // Weight buffer cache: pointer -> MTLBuffer (avoid recreating every dispatch)
+    std::unordered_map<const void*, id<MTLBuffer>> weight_cache;
+
     bool is_available = false;
     std::string dev_name;
 
@@ -130,15 +133,22 @@ struct MetalContext::Impl {
         @autoreleasepool {
             if (!pso) return false;
 
-            // 准备 buffers
-            // W: 使用 no-copy shared buffer (权重数据已 mmap, 直接让 GPU 读)
-            id<MTLBuffer> W_buf = [device newBufferWithBytesNoCopy:(void*)W_data
-                                                           length:W_bytes
-                                                          options:MTLResourceStorageModeShared
-                                                      deallocator:nil];
-            if (!W_buf) {
-                // Fallback: 如果 no-copy 失败 (地址不对齐等), 用 copy 方式
-                W_buf = [device newBufferWithBytes:W_data length:W_bytes options:MTLResourceStorageModeShared];
+            // W buffer: 从缓存中获取或创建 (权重不变, 可复用)
+            id<MTLBuffer> W_buf = nil;
+            auto it = weight_cache.find(W_data);
+            if (it != weight_cache.end()) {
+                W_buf = it->second;
+            } else {
+                W_buf = [device newBufferWithBytesNoCopy:(void*)W_data
+                                                 length:W_bytes
+                                                options:MTLResourceStorageModeShared
+                                            deallocator:nil];
+                if (!W_buf) {
+                    W_buf = [device newBufferWithBytes:W_data length:W_bytes options:MTLResourceStorageModeShared];
+                }
+                if (W_buf) {
+                    weight_cache[W_data] = W_buf;
+                }
             }
             if (!W_buf) return false;
 
@@ -146,7 +156,7 @@ struct MetalContext::Impl {
             int64_t y_bytes = m * sizeof(float);
             ensureBuffers(x_bytes, y_bytes);
 
-            // 拷贝 x 到 GPU buffer
+            // 拷贝 x 到 GPU shared buffer
             memcpy([x_buf contents], x, x_bytes);
 
             // ncols 常量
@@ -162,14 +172,11 @@ struct MetalContext::Impl {
             [encoder setBuffer:y_buf offset:0 atIndex:2];
             [encoder setBytes:&ncols length:sizeof(ncols) atIndex:3];
 
-            // 每行一个线程
-            MTLSize gridSize = MTLSizeMake(m, 1, 1);
-            NSUInteger threadGroupSize = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup, (NSUInteger)m);
-            // 对齐到 32 的倍数 (warp size)
-            if (threadGroupSize > 32) threadGroupSize = (threadGroupSize / 32) * 32;
-            MTLSize tgSize = MTLSizeMake(threadGroupSize, 1, 1);
+            // 每行一个 threadgroup (32 线程), 行内并行 reduce
+            MTLSize numThreadgroups = MTLSizeMake(m, 1, 1);  // m 行 = m 个 threadgroup
+            MTLSize threadsPerGroup = MTLSizeMake(32, 1, 1);  // SIMD group size
 
-            [encoder dispatchThreads:gridSize threadsPerThreadgroup:tgSize];
+            [encoder dispatchThreadgroups:numThreadgroups threadsPerThreadgroup:threadsPerGroup];
             [encoder endEncoding];
 
             [cmdBuf commit];
@@ -183,6 +190,7 @@ struct MetalContext::Impl {
     }
 
     void cleanup() {
+        weight_cache.clear();
         pso_f32  = nil;
         pso_q4_0 = nil;
         pso_q8_0 = nil;
@@ -269,6 +277,100 @@ bool MetalContext::mat_vec_mul(const void* W_data, const float* x, float* y,
     if (!pso) return false;
 
     return impl_->dispatch(pso, W_data, W_bytes, x, n, y, m);
+}
+
+bool MetalContext::mat_vec_mul_batch(const float* x, int64_t n,
+                                     const BatchOp* ops, int num_ops) {
+    if (!impl_ || !impl_->is_available || num_ops == 0) return false;
+
+    @autoreleasepool {
+        // 准备 x buffer
+        int64_t x_bytes = n * sizeof(float);
+        impl_->ensureBuffers(x_bytes, 0);
+        memcpy([impl_->x_buf contents], x, x_bytes);
+        uint32_t ncols = (uint32_t)n;
+
+        // 为每个 op 准备 y buffer
+        struct OpInfo {
+            id<MTLComputePipelineState> pso;
+            id<MTLBuffer> W_buf;
+            id<MTLBuffer> y_buf;
+            float* y_cpu;
+            int64_t y_bytes;
+        };
+        std::vector<OpInfo> infos(num_ops);
+
+        for (int i = 0; i < num_ops; i++) {
+            auto& op = ops[i];
+            auto& info = infos[i];
+
+            // 选择 PSO
+            switch (op.type) {
+                case GGMLType::Q4_0: info.pso = impl_->pso_q4_0; break;
+                case GGMLType::Q8_0: info.pso = impl_->pso_q8_0; break;
+                case GGMLType::Q4_K: info.pso = impl_->pso_q4_k; break;
+                case GGMLType::Q6_K: info.pso = impl_->pso_q6_k; break;
+                default: return false;
+            }
+            if (!info.pso) return false;
+
+            // W buffer (从缓存获取)
+            auto it = impl_->weight_cache.find(op.W_data);
+            if (it != impl_->weight_cache.end()) {
+                info.W_buf = it->second;
+            } else {
+                info.W_buf = [impl_->device newBufferWithBytesNoCopy:(void*)op.W_data
+                                                              length:op.W_bytes
+                                                             options:MTLResourceStorageModeShared
+                                                         deallocator:nil];
+                if (!info.W_buf) {
+                    info.W_buf = [impl_->device newBufferWithBytes:op.W_data
+                                                           length:op.W_bytes
+                                                          options:MTLResourceStorageModeShared];
+                }
+                if (info.W_buf) impl_->weight_cache[op.W_data] = info.W_buf;
+            }
+            if (!info.W_buf) return false;
+
+            // y buffer
+            info.y_bytes = op.m * sizeof(float);
+            info.y_buf = [impl_->device newBufferWithLength:info.y_bytes
+                                                   options:MTLResourceStorageModeShared];
+            info.y_cpu = op.y;
+        }
+
+        // 创建单个 command buffer, 编码所有操作
+        id<MTLCommandBuffer> cmdBuf = [impl_->commandQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+
+        for (int i = 0; i < num_ops; i++) {
+            auto& info = infos[i];
+            auto& op = ops[i];
+
+            [encoder setComputePipelineState:info.pso];
+            [encoder setBuffer:info.W_buf offset:0 atIndex:0];
+            [encoder setBuffer:impl_->x_buf offset:0 atIndex:1];
+            [encoder setBuffer:info.y_buf offset:0 atIndex:2];
+            [encoder setBytes:&ncols length:sizeof(ncols) atIndex:3];
+
+            MTLSize gridSize = MTLSizeMake(op.m, 1, 1);
+            NSUInteger tgSize = MIN((NSUInteger)info.pso.maxTotalThreadsPerThreadgroup, (NSUInteger)op.m);
+            if (tgSize > 32) tgSize = (tgSize / 32) * 32;
+
+            [encoder dispatchThreads:gridSize threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+        }
+
+        [encoder endEncoding];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
+        // 拷贝所有结果回 CPU
+        for (int i = 0; i < num_ops; i++) {
+            memcpy(infos[i].y_cpu, [infos[i].y_buf contents], infos[i].y_bytes);
+        }
+
+        return true;
+    }
 }
 
 } // namespace localllm

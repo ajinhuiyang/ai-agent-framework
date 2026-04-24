@@ -7,6 +7,7 @@ package rules
 
 import (
 	"strings"
+	"unicode"
 
 	"go.uber.org/zap"
 
@@ -178,20 +179,56 @@ func (e *Engine) textSimilarity(text, example string) float64 {
 }
 
 // tokenize splits text into word tokens, handling both Chinese and English.
+// Chinese text is split into bigrams (2-char sliding window) for better matching,
+// English text is split on whitespace/punctuation as before.
 func tokenize(text string) []string {
 	// Split on common delimiters
 	fields := strings.FieldsFunc(text, func(r rune) bool {
 		return r == ' ' || r == '\t' || r == ',' || r == '.' || r == '?' ||
 			r == '!' || r == '、' || r == '，' || r == '。' || r == '？' || r == '！'
 	})
-	result := make([]string, 0, len(fields))
+	result := make([]string, 0, len(fields)*2)
 	for _, f := range fields {
 		f = strings.TrimSpace(f)
-		if f != "" {
-			result = append(result, strings.ToLower(f))
+		if f == "" {
+			continue
+		}
+		lower := strings.ToLower(f)
+
+		// Check if this segment contains CJK characters
+		runes := []rune(lower)
+		hasCJK := false
+		for _, r := range runes {
+			if isCJK(r) {
+				hasCJK = true
+				break
+			}
+		}
+
+		if hasCJK {
+			// For CJK text: emit individual characters and bigrams
+			for i, r := range runes {
+				if isCJK(r) {
+					// Single character
+					result = append(result, string(r))
+					// Bigram (2-char window)
+					if i+1 < len(runes) && isCJK(runes[i+1]) {
+						result = append(result, string(runes[i:i+2]))
+					}
+				}
+			}
+			// Also add the full segment for exact matching
+			result = append(result, lower)
+		} else {
+			result = append(result, lower)
 		}
 	}
 	return result
+}
+
+// isCJK returns true if the rune is a CJK Unified Ideograph.
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r)
 }
 
 // ---------- Entity Extraction ----------

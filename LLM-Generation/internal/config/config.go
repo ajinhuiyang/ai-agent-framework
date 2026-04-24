@@ -26,13 +26,15 @@ type ServerConfig struct {
 }
 
 type LLMConfig struct {
-	DefaultProvider string       `mapstructure:"default_provider"`
-	Temperature     float64      `mapstructure:"temperature"`
-	MaxTokens       int          `mapstructure:"max_tokens"`
-	OpenAI          OpenAIConfig `mapstructure:"openai"`
-	Ollama          OllamaConfig `mapstructure:"ollama"`
-	Zhipu           ZhipuConfig  `mapstructure:"zhipu"`
-	Qwen            QwenConfig   `mapstructure:"qwen"`
+	DefaultProvider   string       `mapstructure:"default_provider"`
+	Temperature       float64      `mapstructure:"temperature"`
+	MaxTokens         int          `mapstructure:"max_tokens"`
+	TopP              float64      `mapstructure:"top_p"`
+	RepetitionPenalty float64      `mapstructure:"repetition_penalty"`
+	OpenAI            OpenAIConfig `mapstructure:"openai"`
+	Ollama            OllamaConfig `mapstructure:"ollama"`
+	Zhipu             ZhipuConfig  `mapstructure:"zhipu"`
+	Qwen              QwenConfig   `mapstructure:"qwen"`
 }
 
 type OpenAIConfig struct {
@@ -115,8 +117,10 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("server.write_timeout", 600)
 	v.SetDefault("server.mode", "debug")
 	v.SetDefault("llm.default_provider", "openai")
-	v.SetDefault("llm.temperature", 0.7)
-	v.SetDefault("llm.max_tokens", 500)
+	v.SetDefault("llm.temperature", 0.6)
+	v.SetDefault("llm.max_tokens", 2048)
+	v.SetDefault("llm.top_p", 0.85)
+	v.SetDefault("llm.repetition_penalty", 1.3)
 	v.SetDefault("llm.openai.api_key", "not-needed")
 	v.SetDefault("llm.openai.base_url", "http://localhost:11434/v1")
 	v.SetDefault("llm.openai.model", "Qwen2.5-Coder-7B-Instruct-Q4_K_M")

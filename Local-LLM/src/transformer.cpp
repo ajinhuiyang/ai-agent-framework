@@ -8,6 +8,7 @@
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <unordered_map>
 
 namespace localllm {
 
@@ -200,6 +201,13 @@ bool Transformer::load_model(const std::string& model_path) {
     k_buf_.resize(config_.num_kv_heads * config_.head_dim);
     v_buf_.resize(config_.num_kv_heads * config_.head_dim);
 
+    // 7. 预计算 RoPE 频率表 (消除 forward 中的 powf 重复计算)
+    int head_dim = config_.head_dim;
+    rope_freq_.resize(head_dim / 2);
+    for (int i = 0; i < head_dim / 2; ++i) {
+        rope_freq_[i] = 1.0f / powf(config_.rope_theta, (float)(2 * i) / head_dim);
+    }
+
     auto end = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     std::cout << "[Model] Model loaded successfully in " << elapsed << " ms" << std::endl;
@@ -232,8 +240,7 @@ void Transformer::forward_attention(int layer, float* x, float* x_out, int32_t p
     for (int h = 0; h < n_kv_heads; ++h) {
         float* k_head = k_buf_.data() + h * head_dim;
         for (int i = 0; i < head_dim; i += 2) {
-            float freq = 1.0f / powf(config_.rope_theta, (float)i / head_dim);
-            float val = pos * freq;
+            float val = pos * rope_freq_[i / 2];
             float cos_val = cosf(val);
             float sin_val = sinf(val);
             float k0 = k_head[i], k1 = k_head[i + 1];
@@ -244,8 +251,7 @@ void Transformer::forward_attention(int layer, float* x, float* x_out, int32_t p
     for (int h = 0; h < n_heads; ++h) {
         float* q_head = q_buf_.data() + h * head_dim;
         for (int i = 0; i < head_dim; i += 2) {
-            float freq = 1.0f / powf(config_.rope_theta, (float)i / head_dim);
-            float val = pos * freq;
+            float val = pos * rope_freq_[i / 2];
             float cos_val = cosf(val);
             float sin_val = sinf(val);
             float q0 = q_head[i], q1 = q_head[i + 1];
@@ -345,7 +351,7 @@ void Transformer::forward_layer(int layer, float* x, int32_t pos) {
     vec_add_inplace(x, x_buf2_.data(), dim);
 }
 
-std::vector<float> Transformer::forward(int32_t token, int32_t pos) {
+const std::vector<float>& Transformer::forward(int32_t token, int32_t pos) {
     int dim = config_.hidden_size;
 
     if (x_embed_.size() != (size_t)dim) x_embed_.resize(dim);
@@ -407,12 +413,11 @@ void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
             if (!lw.bv.empty()) vec_add_inplace(v, lw.bv.data(), kv_dim);
         }
 
-        // RoPE
+        // RoPE (使用预计算频率表)
         for (int h = 0; h < n_kv_heads; ++h) {
             float* k_head = k + h * head_dim;
             for (int i = 0; i < head_dim; i += 2) {
-                float freq = 1.0f / powf(config_.rope_theta, (float)i / head_dim);
-                float val = pos * freq;
+                float val = pos * rope_freq_[i / 2];
                 float cos_val = cosf(val), sin_val = sinf(val);
                 float k0 = k_head[i], k1 = k_head[i + 1];
                 k_head[i]     = k0 * cos_val - k1 * sin_val;
@@ -422,8 +427,7 @@ void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
         for (int h = 0; h < n_heads; ++h) {
             float* q_head = q + h * head_dim;
             for (int i = 0; i < head_dim; i += 2) {
-                float freq = 1.0f / powf(config_.rope_theta, (float)i / head_dim);
-                float val = pos * freq;
+                float val = pos * rope_freq_[i / 2];
                 float cos_val = cosf(val), sin_val = sinf(val);
                 float q0 = q_head[i], q1 = q_head[i + 1];
                 q_head[i]     = q0 * cos_val - q1 * sin_val;
@@ -436,7 +440,7 @@ void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
         memcpy(kv_cache_.value_cache[layer].row_data(pos), v, kv_dim * sizeof(float));
 
         // Attention: Q @ K^T -> softmax -> @ V
-        float* x_out = X_out + t * dim;
+        float* x_out = X_out + t * dim;  // 行主序: 第 t 个 token 的 attention 输出
         float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
         for (int h = 0; h < n_heads; ++h) {
@@ -446,9 +450,15 @@ void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
             // Q @ K^T (包含 causal mask: 只看 [0, pos])
             for (int s = 0; s <= pos; ++s) {
                 const float* k_s = kv_cache_.key_cache[layer].row_data(s) + kv_h * head_dim;
+#ifdef USE_ACCELERATE
+                float score;
+                vDSP_dotpr(q_head, 1, k_s, 1, &score, (vDSP_Length)head_dim);
+                attn_buf_[s] = score * scale;
+#else
                 float score = 0.0f;
                 for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_s[d];
                 attn_buf_[s] = score * scale;
+#endif
             }
 
             softmax(attn_buf_.data(), pos + 1);
@@ -493,54 +503,95 @@ void Transformer::forward_layer_batch(int layer, float* X, int64_t seq_len, int3
     auto& lw = weights_.layers[layer];
     int dim = config_.hidden_size;
 
-    batch_x_buf_.resize(dim * seq_len);
+    // 复用预分配 buffer (resize 不会缩容, 第二层起不会重新分配)
+    batch_norm_buf_.resize(dim * seq_len);
     batch_x_buf2_.resize(dim * seq_len);
+    batch_attn_proj_.resize(dim * seq_len);
 
     // RMSNorm each token
     for (int64_t t = 0; t < seq_len; ++t) {
         float* x = X + t * dim;
-        float* xn = batch_x_buf_.data() + t * dim;
+        float* xn = batch_norm_buf_.data() + t * dim;
         rmsnorm(xn, x, lw.attn_norm.data(), dim, config_.rms_norm_eps);
     }
 
-    // Attention (batch QKV projection, per-token attention with causal mask)
-    forward_attention_batch(layer, batch_x_buf_.data(), batch_x_buf2_.data(), seq_len, pos_start);
+    // Attention
+    forward_attention_batch(layer, batch_norm_buf_.data(), batch_x_buf2_.data(), seq_len, pos_start);
 
-    // Wo projection: attn_out = Wo @ attn_result
-    // batch_x_buf2_ has attention output, project through Wo
-    std::vector<float> attn_projected(dim * seq_len);
-    mat_mat_mul_tensor(lw.wo, batch_x_buf2_.data(), attn_projected.data(), dim, dim, seq_len);
+    // Wo projection
+    mat_mat_mul_tensor(lw.wo, batch_x_buf2_.data(), batch_attn_proj_.data(), dim, dim, seq_len);
 
     // Residual add
-    for (int64_t i = 0; i < dim * seq_len; ++i) X[i] += attn_projected[i];
+    for (int64_t i = 0; i < dim * seq_len; ++i) X[i] += batch_attn_proj_[i];
 
-    // FFN
+    // FFN RMSNorm
     for (int64_t t = 0; t < seq_len; ++t) {
         float* x = X + t * dim;
-        float* xn = batch_x_buf_.data() + t * dim;
+        float* xn = batch_norm_buf_.data() + t * dim;
         rmsnorm(xn, x, lw.ffn_norm.data(), dim, config_.rms_norm_eps);
     }
 
-    forward_ffn_batch(layer, batch_x_buf_.data(), batch_x_buf2_.data(), seq_len);
+    forward_ffn_batch(layer, batch_norm_buf_.data(), batch_x_buf2_.data(), seq_len);
 
     // Residual add
     for (int64_t i = 0; i < dim * seq_len; ++i) X[i] += batch_x_buf2_[i];
 }
 
 std::vector<float> Transformer::forward_batch(const std::vector<int32_t>& tokens, int32_t pos_start) {
-    // 暂时用逐 token 串行模式，确保正确性
-    std::vector<float> logits;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        logits = forward(tokens[i], pos_start + static_cast<int32_t>(i));
+    int64_t seq_len = static_cast<int64_t>(tokens.size());
+    int dim = config_.hidden_size;
+
+    // 少于 4 个 token 时走逐 token 路径
+    if (seq_len < 4) {
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            forward(tokens[i], pos_start + static_cast<int32_t>(i));
+        }
+        kv_cache_.seq_len = pos_start + static_cast<int32_t>(tokens.size());
+        return logits_;
     }
-    kv_cache_.seq_len = pos_start + static_cast<int32_t>(tokens.size());
-    return logits;
+
+    // 构建 embedding 矩阵 [dim * seq_len]
+    batch_x_buf_.resize(dim * seq_len);
+    for (int64_t i = 0; i < seq_len; ++i) {
+        memcpy(batch_x_buf_.data() + i * dim,
+               weights_.token_embedding.row_data(tokens[i]),
+               dim * sizeof(float));
+    }
+
+    // 逐层 batch 前向传播
+    for (int l = 0; l < config_.num_layers; ++l) {
+        forward_layer_batch(l, batch_x_buf_.data(), seq_len, pos_start);
+    }
+
+    // 只取最后一个 token 的 hidden state 计算 logits
+    float* last_hidden = batch_x_buf_.data() + (seq_len - 1) * dim;
+    rmsnorm(last_hidden, last_hidden, weights_.output_norm.data(), dim, config_.rms_norm_eps);
+
+    logits_.resize(config_.vocab_size);
+    mat_vec_mul_tensor(weights_.output, last_hidden, logits_.data(), config_.vocab_size, dim);
+
+    kv_cache_.seq_len = pos_start + static_cast<int32_t>(seq_len);
+    return logits_;
 }
 
 // ======================== 采样 ========================
 
-static int32_t sample_top_p(const std::vector<float>& logits, float temperature, float top_p) {
+static int32_t sample_top_p(std::vector<float>& logits, float temperature, float top_p,
+                            const std::vector<int32_t>& output_tokens, float repetition_penalty) {
     int n = static_cast<int>(logits.size());
+
+    // 重复惩罚: 对已生成的 token 降低 logits
+    if (repetition_penalty != 1.0f && !output_tokens.empty()) {
+        for (int32_t token : output_tokens) {
+            if (token >= 0 && token < n) {
+                if (logits[token] > 0) {
+                    logits[token] /= repetition_penalty;
+                } else {
+                    logits[token] *= repetition_penalty;
+                }
+            }
+        }
+    }
 
     if (temperature <= 0.0f) {
         // Greedy
@@ -560,16 +611,18 @@ static int32_t sample_top_p(const std::vector<float>& logits, float temperature,
         probs[i] /= sum;
     }
 
-    // Top-p (nucleus) sampling
+    // Top-p (nucleus) sampling — 使用 partial_sort 避免全词表排序
+    // 大多数情况下 top_p 只覆盖前 100-500 个 token
+    int k = std::min(512, n);
     std::vector<std::pair<float, int>> prob_idx(n);
     for (int i = 0; i < n; ++i) {
         prob_idx[i] = {probs[i], i};
     }
-    std::sort(prob_idx.begin(), prob_idx.end(), std::greater<>());
+    std::partial_sort(prob_idx.begin(), prob_idx.begin() + k, prob_idx.end(), std::greater<>());
 
     float cumulative = 0.0f;
-    int cutoff = n;
-    for (int i = 0; i < n; ++i) {
+    int cutoff = k;  // 最多搜索前 k 个
+    for (int i = 0; i < k; ++i) {
         cumulative += prob_idx[i].first;
         if (cumulative >= top_p) {
             cutoff = i + 1;
@@ -599,12 +652,13 @@ static int32_t sample_top_p(const std::vector<float>& logits, float temperature,
     return prob_idx[0].second;
 }
 
-std::string Transformer::generate(const std::string& prompt,
+Transformer::GenerateResult Transformer::generate(const std::string& prompt,
                                    int max_tokens,
                                    float temperature,
                                    float top_p,
                                    TokenCallback callback,
-                                   const std::string& system_prompt) {
+                                   const std::string& system_prompt,
+                                   float repetition_penalty) {
     // 构建 prompt tokens
     std::vector<int32_t> prompt_tokens;
 
@@ -671,7 +725,7 @@ std::string Transformer::generate(const std::string& prompt,
     // ==================== Batch Prefill ====================
     // 一次性处理所有 prompt tokens (矩阵×矩阵, 比逐token串行快很多)
     auto prefill_start = std::chrono::high_resolution_clock::now();
-    std::vector<float> logits = forward_batch(prompt_tokens, 0);
+    forward_batch(prompt_tokens, 0);
     int32_t pos = static_cast<int32_t>(prompt_tokens.size());
     auto prefill_end = std::chrono::high_resolution_clock::now();
 
@@ -684,8 +738,47 @@ std::string Transformer::generate(const std::string& prompt,
     int decode_tokens = 0;
     auto decode_start = std::chrono::high_resolution_clock::now();
 
+    // 退化检测: 基于 token n-gram 重复率
+    // 记录最近生成的 token，检测是否出现 n-gram 重复
+    auto detect_degeneration = [](const std::vector<int32_t>& tokens, int recent_count = 64) -> bool {
+        int total = static_cast<int>(tokens.size());
+        if (total < recent_count * 2) return false;
+
+        // 检查最近 recent_count 个 token 中的 4-gram 重复率
+        int start_idx = total - recent_count;
+        std::unordered_map<uint64_t, int> ngram_counts;
+        int ngram_total = 0;
+        int ngram_repeated = 0;
+
+        for (int i = start_idx; i + 3 < total; ++i) {
+            // 简单哈希: 将4个token组合成一个uint64
+            uint64_t h = static_cast<uint64_t>(tokens[i]) * 1000003ULL;
+            h = (h + static_cast<uint64_t>(tokens[i+1])) * 1000003ULL;
+            h = (h + static_cast<uint64_t>(tokens[i+2])) * 1000003ULL;
+            h = h + static_cast<uint64_t>(tokens[i+3]);
+            ngram_counts[h]++;
+            ngram_total++;
+        }
+
+        for (auto& [_, count] : ngram_counts) {
+            if (count > 1) {
+                ngram_repeated += count - 1;
+            }
+        }
+
+        // 如果超过 30% 的 4-gram 是重复的，判定为退化
+        float repeat_ratio = (ngram_total > 0) ? static_cast<float>(ngram_repeated) / ngram_total : 0;
+        return repeat_ratio > 0.3f;
+    };
+
+    // 代码生成智能停止: 追踪代码块结构
+    int code_block_count = 0;       // 已完成的代码块数量
+    bool in_code_block = false;
+    int code_block_content_tokens = 0;  // 当前代码块内的 token 数
+    int post_code_tokens = 0;           // 最后一个代码块结束后的 token 数
+
     for (int i = 0; i < max_tokens; ++i) {
-        int32_t next_token = sample_top_p(logits, temperature, top_p);
+        int32_t next_token = sample_top_p(logits_, temperature, top_p, output_tokens, repetition_penalty);
 
         if (tokenizer_.is_eos(next_token)) {
             break;
@@ -695,13 +788,79 @@ std::string Transformer::generate(const std::string& prompt,
         std::string token_text = tokenizer_.decode(next_token);
         generated_text += token_text;
 
+        // 追踪代码块状态 (只在 token 文本以 ``` 开头或仅为 ``` 时触发)
+        {
+            std::string trimmed = token_text;
+            // 移除前导空白
+            size_t start_pos = trimmed.find_first_not_of(" \t\n\r");
+            if (start_pos != std::string::npos) {
+                trimmed = trimmed.substr(start_pos);
+            }
+            if (trimmed.substr(0, 3) == "```") {
+                if (in_code_block) {
+                    // 代码块结束
+                    in_code_block = false;
+                    if (code_block_content_tokens > 5) {
+                        // 只有内容足够长的代码块才计数
+                        code_block_count++;
+                        post_code_tokens = 0;
+                    }
+                } else {
+                    in_code_block = true;
+                    code_block_content_tokens = 0;
+                }
+            }
+        }
+
+        if (in_code_block) {
+            code_block_content_tokens++;
+        }
+
+        // 如果已有一个完整代码块，检查是否开始重复
+        if (code_block_count >= 1 && !in_code_block) {
+            post_code_tokens++;
+            if (post_code_tokens > 120) {
+                // 代码块结束后过长的解释文字，停止
+                break;
+            }
+        }
+
+        // 第二个完整代码块出现 — 大概率是退化重复
+        if (code_block_count >= 2) {
+            std::cout << "[Generate] Second code block completed, stopping to prevent repetition" << std::endl;
+            // 回退到第二个代码块开始的 ``` 之前
+            // 从末尾倒着找三次 ``` (第2块的关闭、第2块的开启)
+            auto p = generated_text.rfind("```");
+            if (p != std::string::npos && p > 0) {
+                p = generated_text.rfind("```", p - 1);
+                if (p != std::string::npos && p > 0) {
+                    auto prev_nl = generated_text.rfind('\n', p);
+                    if (prev_nl != std::string::npos) {
+                        generated_text = generated_text.substr(0, prev_nl + 1);
+                    }
+                }
+            }
+            break;
+        }
+
+        // 每 16 个 token 检测 n-gram 退化
+        if (decode_tokens > 32 && decode_tokens % 16 == 0 && detect_degeneration(output_tokens)) {
+            std::cout << "[Generate] N-gram repetition detected at token " << decode_tokens << ", stopping early" << std::endl;
+            // 回退到最后一个完整行
+            auto last_newline = generated_text.rfind('\n', generated_text.size() > 32 ? generated_text.size() - 32 : 0);
+            if (last_newline != std::string::npos && last_newline > generated_text.size() / 3) {
+                generated_text = generated_text.substr(0, last_newline + 1);
+            }
+            break;
+        }
+
         if (callback) {
             if (!callback(next_token, token_text)) {
                 break;
             }
         }
 
-        logits = forward(next_token, pos);
+        forward(next_token, pos);
         pos++;
         decode_tokens++;
     }
@@ -715,7 +874,11 @@ std::string Transformer::generate(const std::string& prompt,
               << decode_ms << " ms (" << decode_tps << " tok/s)" << std::endl;
     std::cout << "[Generate] Total: " << total_ms << " ms" << std::endl;
 
-    return generated_text;
+    GenerateResult result;
+    result.text = generated_text;
+    result.prompt_tokens = static_cast<int>(prompt_tokens.size());
+    result.completion_tokens = decode_tokens;
+    return result;
 }
 
 } // namespace localllm

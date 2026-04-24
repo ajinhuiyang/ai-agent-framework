@@ -63,12 +63,13 @@ type Message struct {
 
 // GenerateConfig provides runtime parameters for generation.
 type GenerateConfig struct {
-	Temperature float64  `json:"temperature,omitempty"`
-	MaxTokens   int      `json:"max_tokens,omitempty"`
-	TopP        float64  `json:"top_p,omitempty"`
-	TopK        int      `json:"top_k,omitempty"`
-	StopWords   []string `json:"stop_words,omitempty"`
-	Model       string   `json:"model,omitempty"`
+	Temperature       float64  `json:"temperature,omitempty"`
+	MaxTokens         int      `json:"max_tokens,omitempty"`
+	TopP              float64  `json:"top_p,omitempty"`
+	TopK              int      `json:"top_k,omitempty"`
+	RepetitionPenalty float64  `json:"repetition_penalty,omitempty"`
+	StopWords         []string `json:"stop_words,omitempty"`
+	Model             string   `json:"model,omitempty"`
 }
 
 // GenerateResponse is the complete generation result.

@@ -13,8 +13,10 @@ server:
 # Default LLM provider
 llm:
   default_provider: "openai"  # Use "openai" to route to Local-LLM
-  temperature: 0.7
-  max_tokens: 500   # ~1200字中文
+  temperature: 0.6
+  max_tokens: 2048  # 代码生成需要足够的 token 预算
+  top_p: 0.85
+  repetition_penalty: 1.3  # 抑制重复内容
 
   # OpenAI-compatible → points to Local-LLM (C++)
   openai:

@@ -89,16 +89,22 @@ public:
 
     // 前向传播: 输入 token -> 输出 logits [vocab_size]
     // pos: 当前 token 在序列中的位置
-    std::vector<float> forward(int32_t token, int32_t pos);
+    const std::vector<float>& forward(int32_t token, int32_t pos);
 
     // 生成文本
     using TokenCallback = std::function<bool(int32_t token, const std::string& text)>;
-    std::string generate(const std::string& prompt,
-                         int max_tokens = 256,
+    struct GenerateResult {
+        std::string text;
+        int prompt_tokens = 0;
+        int completion_tokens = 0;
+    };
+    GenerateResult generate(const std::string& prompt,
+                         int max_tokens = 2048,
                          float temperature = 0.7f,
                          float top_p = 0.9f,
                          TokenCallback callback = nullptr,
-                         const std::string& system_prompt = "");
+                         const std::string& system_prompt = "",
+                         float repetition_penalty = 1.3f);
 
     // 清除 KV cache (开始新对话)
     void reset();
@@ -150,11 +156,16 @@ private:
     // Batch prefill 临时 buffer (按需分配)
     std::vector<float> batch_x_buf_;   // [hidden_size * seq_len]
     std::vector<float> batch_x_buf2_;  // [hidden_size * seq_len]
+    std::vector<float> batch_norm_buf_;  // [hidden_size * seq_len] RMSNorm 输出
+    std::vector<float> batch_attn_proj_; // [hidden_size * seq_len] Wo 投影输出
     std::vector<float> batch_q_buf_;   // [num_heads * head_dim * seq_len]
     std::vector<float> batch_k_buf_;   // [num_kv_heads * head_dim * seq_len]
     std::vector<float> batch_v_buf_;   // [num_kv_heads * head_dim * seq_len]
     std::vector<float> batch_ffn1_;    // [intermediate_size * seq_len]
     std::vector<float> batch_ffn2_;    // [intermediate_size * seq_len]
+
+    // RoPE 预计算频率表 [head_dim/2]
+    std::vector<float> rope_freq_;
 };
 
 } // namespace localllm

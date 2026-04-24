@@ -32,6 +32,18 @@ public:
     bool mat_vec_mul_f32(const float* W, const float* x, float* y,
                          int64_t m, int64_t n);
 
+    // 批量矩阵-向量乘法: 多个独立的 matmul 合并到一个 GPU command buffer
+    // 同一个 x 输入, 多个 W 和 y 输出 (如 wq/wk/wv 共享输入)
+    struct BatchOp {
+        const void* W_data;
+        int64_t W_bytes;
+        float* y;
+        int64_t m;
+        GGMLType type;
+    };
+    bool mat_vec_mul_batch(const float* x, int64_t n,
+                           const BatchOp* ops, int num_ops);
+
     // 为经常使用的 buffer 预分配 GPU 内存
     void preallocate(int64_t max_rows, int64_t max_cols);
 

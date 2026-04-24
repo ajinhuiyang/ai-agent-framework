@@ -355,7 +355,7 @@ func (e *Engine) Predict(ctx context.Context, req domain.InferenceRequest) (engi
 		// Copy logits since sample modifies in-place and buffer is reused.
 		logits := make([]float32, len(logitsRef))
 		copy(logits, logitsRef)
-		nextToken := e.sample(logits, req.Options)
+		nextToken := e.sample(logits, req.Options, generated)
 
 		if nextToken == e.tok.EOSID() {
 			break
@@ -405,6 +405,7 @@ func (e *Engine) PredictStream(ctx context.Context, req domain.InferenceRequest)
 			maxGen = 256
 		}
 
+		var generated []int
 		for i := 0; i < maxGen; i++ {
 			select {
 			case <-ctx.Done():
@@ -416,7 +417,7 @@ func (e *Engine) PredictStream(ctx context.Context, req domain.InferenceRequest)
 			logitsRef := e.forward(tokens)
 			logits := make([]float32, len(logitsRef))
 			copy(logits, logitsRef)
-			nextToken := e.sample(logits, req.Options)
+			nextToken := e.sample(logits, req.Options, generated)
 
 			if nextToken == e.tok.EOSID() {
 				ch <- engine.StreamToken{Done: true}
@@ -429,6 +430,7 @@ func (e *Engine) PredictStream(ctx context.Context, req domain.InferenceRequest)
 				return
 			}
 
+			generated = append(generated, nextToken)
 			ch <- engine.StreamToken{Text: text}
 			tokens = []int{nextToken}
 		}
@@ -976,10 +978,24 @@ func softmax(x []float32) {
 // ======================================================================
 
 // sample selects the next token from logits.
-func (e *Engine) sample(logits []float32, opts domain.Options) int {
+func (e *Engine) sample(logits []float32, opts domain.Options, generatedTokens []int) int {
 	temp := opts.Temperature
 	if temp <= 0 {
 		temp = 1.0
+	}
+
+	// Apply repetition penalty before any other processing.
+	if opts.RepeatPenalty > 1 && len(generatedTokens) > 0 {
+		penalty := float32(opts.RepeatPenalty)
+		for _, tok := range generatedTokens {
+			if tok >= 0 && tok < len(logits) {
+				if logits[tok] > 0 {
+					logits[tok] /= penalty
+				} else {
+					logits[tok] *= penalty
+				}
+			}
+		}
 	}
 
 	// Greedy (temperature ~0).
@@ -1002,11 +1018,6 @@ func (e *Engine) sample(logits []float32, opts domain.Options) int {
 	topP := opts.TopP
 	if topP > 0 && topP < 1 {
 		logits = topPFilter(logits, float32(topP))
-	}
-
-	// Apply repetition penalty (simplified).
-	if opts.RepeatPenalty > 1 {
-		// Would need generated token history; skipped for simplicity.
 	}
 
 	// Convert to probabilities.

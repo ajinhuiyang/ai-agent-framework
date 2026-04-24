@@ -286,14 +286,9 @@ inline void mat_vec_mul_tensor(const Tensor& W, const float* x, float* y, int64_
         return;
     }
 
-#ifdef USE_METAL
-    // 优先尝试 GPU
-    if (MetalContext::instance().mat_vec_mul(
-            W.quant_row_data(0), x, y, m, n, W.type())) {
-        return;
-    }
-    // GPU 不支持此量化类型或执行失败, fallback 到 CPU
-#endif
+    // 注: Apple Silicon UMA 上 CPU NEON + 多线程比 Metal GPU mat-vec-mul 更快
+    // GPU dispatch 开销 (command buffer + sync + memcpy) 抵消了并行计算收益
+    // 未来可在 batch matmul (prefill) 场景下重新启用 Metal
 
     GGMLType wtype = W.type();
     // 检查是否有融合 dot product 实现

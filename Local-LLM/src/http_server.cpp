@@ -494,13 +494,14 @@ HttpResponse HttpServer::handle_chat_completions(const HttpRequest& req) {
 
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
-        int max_tokens = static_cast<int>(json.get_int("max_tokens", 256));
+        int max_tokens = static_cast<int>(json.get_int("max_tokens", 2048));
+        float repetition_penalty = json.get_float("repetition_penalty", 1.3);
 
         // 推理 — system 和 user 分开传给 generate()
         std::lock_guard<std::mutex> lock(model_mutex_);
         model_.reset();
 
-        std::string generated = model_.generate(user_msg, max_tokens, temperature, top_p, nullptr, system_msg);
+        auto gen_result = model_.generate(user_msg, max_tokens, temperature, top_p, nullptr, system_msg, repetition_penalty);
 
         // 构建 OpenAI 兼容响应
         auto now = std::chrono::system_clock::now();
@@ -518,7 +519,7 @@ HttpResponse HttpServer::handle_chat_completions(const HttpRequest& req) {
 
         SimpleJSON message = SimpleJSON::object();
         message["role"] = SimpleJSON("assistant");
-        message["content"] = SimpleJSON(generated);
+        message["content"] = SimpleJSON(gen_result.text);
         choice["message"] = message;
         choice["finish_reason"] = SimpleJSON("stop");
 
@@ -527,9 +528,9 @@ HttpResponse HttpServer::handle_chat_completions(const HttpRequest& req) {
         result["choices"] = choices;
 
         SimpleJSON usage = SimpleJSON::object();
-        usage["prompt_tokens"] = SimpleJSON(0);
-        usage["completion_tokens"] = SimpleJSON(0);
-        usage["total_tokens"] = SimpleJSON(0);
+        usage["prompt_tokens"] = SimpleJSON(static_cast<int64_t>(gen_result.prompt_tokens));
+        usage["completion_tokens"] = SimpleJSON(static_cast<int64_t>(gen_result.completion_tokens));
+        usage["total_tokens"] = SimpleJSON(static_cast<int64_t>(gen_result.prompt_tokens + gen_result.completion_tokens));
         result["usage"] = usage;
 
         resp.set_json(result.dump());
@@ -564,7 +565,8 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
 
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
-        int max_tokens = static_cast<int>(json.get_int("max_tokens", 256));
+        int max_tokens = static_cast<int>(json.get_int("max_tokens", 2048));
+        float repetition_penalty = json.get_float("repetition_penalty", 1.3);
 
         // 发送 SSE 头
         std::string header = "HTTP/1.1 200 OK\r\n"
@@ -605,7 +607,7 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
                 std::string sse = "data: " + chunk.dump() + "\n\n";
                 int sent = platform::socket_send(client_fd, sse.c_str(), static_cast<int>(sse.size()));
                 return sent >= 0;
-            }, system_msg);
+            }, system_msg, repetition_penalty);
 
         // 发送结束标志
         std::string done = "data: [DONE]\n\n";
@@ -624,19 +626,20 @@ HttpResponse HttpServer::handle_completions(const HttpRequest& req) {
         std::string prompt = json.get_string("prompt", "");
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
-        int max_tokens = static_cast<int>(json.get_int("max_tokens", 256));
+        int max_tokens = static_cast<int>(json.get_int("max_tokens", 2048));
+        float repetition_penalty = json.get_float("repetition_penalty", 1.3);
 
         std::lock_guard<std::mutex> lock(model_mutex_);
         model_.reset();
 
-        std::string generated = model_.generate(prompt, max_tokens, temperature, top_p);
+        auto gen_result = model_.generate(prompt, max_tokens, temperature, top_p, nullptr, "", repetition_penalty);
 
         SimpleJSON result = SimpleJSON::object();
         result["id"] = SimpleJSON("cmpl-localllm");
         result["object"] = SimpleJSON("text_completion");
 
         SimpleJSON choice = SimpleJSON::object();
-        choice["text"] = SimpleJSON(generated);
+        choice["text"] = SimpleJSON(gen_result.text);
         choice["index"] = SimpleJSON(0);
         choice["finish_reason"] = SimpleJSON("stop");
 
