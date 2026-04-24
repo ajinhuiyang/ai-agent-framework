@@ -1,6 +1,7 @@
 #pragma once
 
 #include "transformer.h"
+#include "platform.h"
 
 #include <atomic>
 #include <functional>
@@ -126,10 +127,10 @@ public:
 
 private:
     void server_loop();
-    void handle_client(int client_fd);
+    void handle_client(platform::socket_t client_fd);
 
     // 解析 HTTP 请求
-    HttpRequest parse_request(int client_fd);
+    HttpRequest parse_request(platform::socket_t client_fd);
 
     // API 路由
     HttpResponse handle_request(const HttpRequest& req);
@@ -139,11 +140,11 @@ private:
     HttpResponse handle_health(const HttpRequest& req);
 
     // 处理 SSE 流式响应
-    void handle_chat_completions_stream(int client_fd, const HttpRequest& req);
+    void handle_chat_completions_stream(platform::socket_t client_fd, const HttpRequest& req);
 
     Transformer& model_;
     int port_;
-    int server_fd_ = -1;
+    platform::socket_t server_fd_ = platform::INVALID_SOCK;
     std::atomic<bool> running_{false};
     std::thread server_thread_;
     std::mutex model_mutex_; // 保护模型推理 (单线程推理)

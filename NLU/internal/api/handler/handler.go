@@ -289,8 +289,8 @@ func (h *NLUHandler) Ask(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// ========== Step 1: NLU — Understand intent + entities ==========
-	h.logger.Info("ask: step 1 — NLU processing", zap.String("text", req.Text))
+	// ========== Step 1: NLU — Fast rule-based analysis (no LLM call) ==========
+	h.logger.Info("ask: step 1 — NLU processing (rule-based)", zap.String("text", req.Text))
 
 	nluReq := &domain.NLURequest{
 		Text:         req.Text,
@@ -301,7 +301,6 @@ func (h *NLUHandler) Ask(c *gin.Context) {
 	nluResult, err := h.engine.Process(ctx, nluReq)
 	if err != nil {
 		h.logger.Error("ask: NLU failed", zap.Error(err))
-		// NLU failure is non-fatal — continue without NLU enrichment.
 		nluResult = &domain.NLUResult{Text: req.Text, Errors: []string{"NLU failed: " + err.Error()}}
 	}
 

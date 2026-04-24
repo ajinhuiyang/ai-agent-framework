@@ -1,13 +1,10 @@
 #include "gguf_parser.h"
+#include "platform.h"
 
 #include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 namespace localllm {
 
@@ -43,11 +40,7 @@ GGMLTypeTraits get_type_traits(GGMLType type) {
 // ======================== GGUFParser 实现 ========================
 
 GGUFParser::~GGUFParser() {
-    if (mmap_addr_ && mmap_size_ > 0) {
-        munmap(mmap_addr_, mmap_size_);
-        mmap_addr_ = nullptr;
-        mmap_size_ = 0;
-    }
+    platform::munmap_file(mapped_file_);
 }
 
 template<typename T>
@@ -200,27 +193,15 @@ bool GGUFParser::load(const std::string& filepath) {
 
         fclose(f);
 
-        // 5. 使用 mmap 映射文件
-        int fd = open(filepath.c_str(), O_RDONLY);
-        if (fd < 0) {
-            std::cerr << "[GGUF] Failed to open file for mmap: " << filepath << std::endl;
+        // 5. 使用跨平台 mmap 映射文件
+        if (!platform::mmap_file(filepath, mapped_file_)) {
+            std::cerr << "[GGUF] Failed to memory-map file: " << filepath << std::endl;
             return false;
         }
 
-        mmap_size_ = file_size_;
-        mmap_addr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd, 0);
-        close(fd);
+        platform::madvise_sequential(mapped_file_);
 
-        if (mmap_addr_ == MAP_FAILED) {
-            std::cerr << "[GGUF] mmap failed" << std::endl;
-            mmap_addr_ = nullptr;
-            return false;
-        }
-
-        // madvise 建议内核顺序读取
-        madvise(mmap_addr_, mmap_size_, MADV_SEQUENTIAL);
-
-        data_start_ = static_cast<uint8_t*>(mmap_addr_) + data_offset;
+        data_start_ = static_cast<uint8_t*>(mapped_file_.addr) + data_offset;
 
         std::cout << "[GGUF] File loaded successfully. Data offset: " << data_offset
                   << ", File size: " << file_size_ << std::endl;

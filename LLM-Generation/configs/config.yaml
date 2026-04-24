@@ -14,7 +14,7 @@ server:
 llm:
   default_provider: "openai"  # Use "openai" to route to Local-LLM
   temperature: 0.7
-  max_tokens: 4096
+  max_tokens: 500   # ~1200字中文
 
   # OpenAI-compatible → points to Local-LLM (C++)
   openai:
@@ -47,11 +47,7 @@ conversation:
 
 # Prompt templates
 prompt:
-  default_system: |
-    You are an expert code assistant. You help developers write, analyze,
-    debug, refactor, and test code. Always provide clean, well-structured
-    code with clear explanations. Use markdown code blocks with language
-    tags for all code output.
+  default_system: "You are a helpful code assistant. Answer in the same language as the user. If the user asks in Chinese, reply in Chinese. Provide clean code with brief explanations."
   rag_system: |
     You are a code assistant with access to a codebase knowledge base.
     Use the following retrieved code context to answer the developer's question.

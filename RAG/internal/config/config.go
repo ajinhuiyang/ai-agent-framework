@@ -31,6 +31,7 @@ type EmbeddingConfig struct {
 	Provider string          `mapstructure:"provider"`
 	OpenAI   EmbeddingOpenAI `mapstructure:"openai"`
 	Ollama   EmbeddingOllama `mapstructure:"ollama"`
+	Local    EmbeddingLocal  `mapstructure:"local"`
 }
 
 type EmbeddingOpenAI struct {
@@ -44,6 +45,10 @@ type EmbeddingOllama struct {
 	BaseURL   string `mapstructure:"base_url"`
 	Model     string `mapstructure:"model"`
 	Dimension int    `mapstructure:"dimension"`
+}
+
+type EmbeddingLocal struct {
+	Dimension int `mapstructure:"dimension"`
 }
 
 type VectorStoreConfig struct {

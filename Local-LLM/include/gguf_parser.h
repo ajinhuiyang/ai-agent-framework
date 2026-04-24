@@ -1,5 +1,6 @@
 #pragma once
 
+#include "platform.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -183,9 +184,8 @@ private:
     std::map<std::string, GGUFMetadataValue> metadata_;
     std::vector<GGUFTensorInfo> tensors_;
 
-    // 内存映射
-    void* mmap_addr_ = nullptr;
-    size_t mmap_size_ = 0;
+    // 内存映射 (跨平台)
+    platform::MappedFile mapped_file_;
     uint8_t* data_start_ = nullptr; // 张量数据段起始地址
 
     std::string filepath_;

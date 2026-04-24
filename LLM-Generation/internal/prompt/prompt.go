@@ -20,7 +20,7 @@ type Manager struct {
 // New creates a new prompt Manager.
 func New(defaultSystem, ragSystem string, templates map[string]string) *Manager {
 	if defaultSystem == "" {
-		defaultSystem = "You are a helpful, accurate, and concise AI assistant."
+		defaultSystem = "You are a helpful code assistant. Answer in the same language as the user's question. If the user asks in Chinese, reply in Chinese."
 	}
 	if templates == nil {
 		templates = make(map[string]string)

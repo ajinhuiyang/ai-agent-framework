@@ -1,13 +1,10 @@
 #include "http_server.h"
+#include "platform.h"
 
-#include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
 #include <iostream>
-#include <netinet/in.h>
 #include <sstream>
-#include <sys/socket.h>
-#include <unistd.h>
 
 namespace localllm {
 
@@ -276,31 +273,10 @@ HttpServer::~HttpServer() {
 }
 
 bool HttpServer::start() {
-    server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd_ < 0) {
-        std::cerr << "[HTTP] Failed to create socket" << std::endl;
-        return false;
-    }
-
-    int opt = 1;
-    setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port_);
-
-    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    platform::socket_init();
+    server_fd_ = platform::socket_listen(port_);
+    if (server_fd_ == platform::INVALID_SOCK) {
         std::cerr << "[HTTP] Failed to bind to port " << port_ << std::endl;
-        close(server_fd_);
-        server_fd_ = -1;
-        return false;
-    }
-
-    if (listen(server_fd_, 10) < 0) {
-        std::cerr << "[HTTP] Failed to listen" << std::endl;
-        close(server_fd_);
-        server_fd_ = -1;
         return false;
     }
 
@@ -319,13 +295,14 @@ bool HttpServer::start() {
 
 void HttpServer::stop() {
     running_ = false;
-    if (server_fd_ >= 0) {
-        close(server_fd_);
-        server_fd_ = -1;
+    if (server_fd_ != platform::INVALID_SOCK) {
+        platform::socket_close(server_fd_);
+        server_fd_ = platform::INVALID_SOCK;
     }
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+    platform::socket_cleanup();
 }
 
 void HttpServer::wait() {
@@ -336,17 +313,8 @@ void HttpServer::wait() {
 
 void HttpServer::server_loop() {
     while (running_) {
-        struct sockaddr_in client_addr{};
-        socklen_t client_len = sizeof(client_addr);
-
-        // 设置 accept 超时
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        setsockopt(server_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) {
+        platform::socket_t client_fd = platform::socket_accept(server_fd_);
+        if (client_fd == platform::INVALID_SOCK) {
             continue; // timeout 或错误, 继续循环
         }
 
@@ -355,16 +323,16 @@ void HttpServer::server_loop() {
     }
 }
 
-HttpRequest HttpServer::parse_request(int client_fd) {
+HttpRequest HttpServer::parse_request(platform::socket_t client_fd) {
     HttpRequest req;
 
     // 读取请求数据
     std::string raw;
     char buf[4096];
-    ssize_t n;
+    int n;
 
     // 读取头部
-    while ((n = recv(client_fd, buf, sizeof(buf) - 1, 0)) > 0) {
+    while ((n = platform::socket_recv(client_fd, buf, sizeof(buf) - 1)) > 0) {
         buf[n] = '\0';
         raw += buf;
 
@@ -384,7 +352,7 @@ HttpRequest HttpServer::parse_request(int client_fd) {
 
             // 继续读取 body
             while (body_received < content_length) {
-                n = recv(client_fd, buf, std::min(sizeof(buf) - 1, content_length - body_received), 0);
+                n = platform::socket_recv(client_fd, buf, std::min((int)(sizeof(buf) - 1), (int)(content_length - body_received)));
                 if (n <= 0) break;
                 buf[n] = '\0';
                 raw += buf;
@@ -440,11 +408,11 @@ HttpRequest HttpServer::parse_request(int client_fd) {
     return req;
 }
 
-void HttpServer::handle_client(int client_fd) {
+void HttpServer::handle_client(platform::socket_t client_fd) {
     auto req = parse_request(client_fd);
 
     if (req.method.empty()) {
-        close(client_fd);
+        platform::socket_close(client_fd);
         return;
     }
 
@@ -456,8 +424,8 @@ void HttpServer::handle_client(int client_fd) {
         resp.status_code = 204;
         resp.body = "";
         auto raw = resp.to_http_response();
-        send(client_fd, raw.c_str(), raw.size(), 0);
-        close(client_fd);
+        platform::socket_send(client_fd, raw.c_str(), static_cast<int>(raw.size()));
+        platform::socket_close(client_fd);
         return;
     }
 
@@ -466,15 +434,15 @@ void HttpServer::handle_client(int client_fd) {
         auto json = SimpleJSON::parse(req.body);
         if (json.get_bool("stream", false)) {
             handle_chat_completions_stream(client_fd, req);
-            close(client_fd);
+            platform::socket_close(client_fd);
             return;
         }
     }
 
     auto resp = handle_request(req);
     auto raw = resp.to_http_response();
-    send(client_fd, raw.c_str(), raw.size(), 0);
-    close(client_fd);
+    platform::socket_send(client_fd, raw.c_str(), static_cast<int>(raw.size()));
+    platform::socket_close(client_fd);
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
@@ -504,30 +472,35 @@ HttpResponse HttpServer::handle_chat_completions(const HttpRequest& req) {
 
         // 解析 messages
         const auto& messages = json.get_array("messages");
-        std::string prompt;
+        // 提取消息内容, 让 generate() 内部处理 chat template
+        std::string system_msg;
+        std::string user_msg;
         for (const auto& msg : messages) {
             std::string role = msg.get_string("role", "user");
             std::string content = msg.get_string("content", "");
 
             if (role == "system") {
-                prompt += "System: " + content + "\n\n";
+                system_msg = content;
             } else if (role == "user") {
-                prompt += "User: " + content + "\n\n";
-            } else if (role == "assistant") {
-                prompt += "Assistant: " + content + "\n\n";
+                user_msg += content + "\n";
             }
         }
-        prompt += "Assistant: ";
+        // 将 system prompt 和 user message 合并为一个 prompt
+        // generate() 会自动包装 Qwen chat template
+        std::string prompt = user_msg;
+        if (!system_msg.empty()) {
+            prompt = system_msg + "\n\n" + user_msg;
+        }
 
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
         int max_tokens = static_cast<int>(json.get_int("max_tokens", 256));
 
-        // 推理
+        // 推理 — system 和 user 分开传给 generate()
         std::lock_guard<std::mutex> lock(model_mutex_);
         model_.reset();
 
-        std::string generated = model_.generate(prompt, max_tokens, temperature, top_p);
+        std::string generated = model_.generate(user_msg, max_tokens, temperature, top_p, nullptr, system_msg);
 
         // 构建 OpenAI 兼容响应
         auto now = std::chrono::system_clock::now();
@@ -573,19 +546,21 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
         auto json = SimpleJSON::parse(req.body);
 
         const auto& messages = json.get_array("messages");
-        std::string prompt;
+        std::string system_msg;
+        std::string user_msg;
         for (const auto& msg : messages) {
             std::string role = msg.get_string("role", "user");
             std::string content = msg.get_string("content", "");
             if (role == "system") {
-                prompt += "System: " + content + "\n\n";
+                system_msg = content;
             } else if (role == "user") {
-                prompt += "User: " + content + "\n\n";
-            } else if (role == "assistant") {
-                prompt += "Assistant: " + content + "\n\n";
+                user_msg += content + "\n";
             }
         }
-        prompt += "Assistant: ";
+        std::string prompt = user_msg;
+        if (!system_msg.empty()) {
+            prompt = system_msg + "\n\n" + user_msg;
+        }
 
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
@@ -598,7 +573,7 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
                               "Connection: keep-alive\r\n"
                               "Access-Control-Allow-Origin: *\r\n"
                               "\r\n";
-        send(client_fd, header.c_str(), header.size(), 0);
+        platform::socket_send(client_fd, header.c_str(), static_cast<int>(header.size()));
 
         std::lock_guard<std::mutex> lock(model_mutex_);
         model_.reset();
@@ -607,7 +582,7 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
         auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
             now.time_since_epoch()).count();
 
-        model_.generate(prompt, max_tokens, temperature, top_p,
+        model_.generate(user_msg, max_tokens, temperature, top_p,
             [&](int32_t /*token*/, const std::string& text) -> bool {
                 SimpleJSON chunk = SimpleJSON::object();
                 chunk["id"] = SimpleJSON("chatcmpl-localllm");
@@ -628,13 +603,13 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
                 chunk["choices"] = choices;
 
                 std::string sse = "data: " + chunk.dump() + "\n\n";
-                ssize_t sent = send(client_fd, sse.c_str(), sse.size(), 0);
+                int sent = platform::socket_send(client_fd, sse.c_str(), static_cast<int>(sse.size()));
                 return sent >= 0;
-            });
+            }, system_msg);
 
         // 发送结束标志
         std::string done = "data: [DONE]\n\n";
-        send(client_fd, done.c_str(), done.size(), 0);
+        platform::socket_send(client_fd, done.c_str(), static_cast<int>(done.size()));
 
     } catch (const std::exception& e) {
         std::cerr << "[HTTP] Stream error: " << e.what() << std::endl;

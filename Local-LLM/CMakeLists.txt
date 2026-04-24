@@ -26,6 +26,21 @@ if(APPLE)
             message(STATUS "Using Apple Accelerate framework")
         endif()
     endif()
+
+    # Metal GPU 加速 (自动检测)
+    option(USE_METAL "Use Apple Metal for GPU acceleration" ON)
+    if(USE_METAL)
+        find_library(METAL_FRAMEWORK Metal)
+        find_library(FOUNDATION_FRAMEWORK Foundation)
+        if(METAL_FRAMEWORK AND FOUNDATION_FRAMEWORK)
+            enable_language(OBJCXX)
+            add_definitions(-DUSE_METAL)
+            message(STATUS "Metal GPU acceleration: ENABLED")
+        else()
+            set(USE_METAL OFF)
+            message(STATUS "Metal GPU acceleration: DISABLED (framework not found)")
+        endif()
+    endif()
 endif()
 
 # 线程库
@@ -41,7 +56,13 @@ set(SOURCES
     src/tokenizer.cpp
     src/transformer.cpp
     src/http_server.cpp
+    src/platform.cpp
 )
+
+# Metal 源文件
+if(APPLE AND USE_METAL)
+    list(APPEND SOURCES src/metal_compute.mm)
+endif()
 
 # 静态库
 add_library(localllm_lib STATIC ${SOURCES})
@@ -50,6 +71,14 @@ target_link_libraries(localllm_lib PUBLIC Threads::Threads)
 
 if(APPLE AND ACCELERATE_FRAMEWORK)
     target_link_libraries(localllm_lib PUBLIC ${ACCELERATE_FRAMEWORK})
+endif()
+
+if(APPLE AND USE_METAL)
+    target_link_libraries(localllm_lib PUBLIC ${METAL_FRAMEWORK} ${FOUNDATION_FRAMEWORK})
+    # Metal shader 路径 (运行时从源文件编译)
+    target_compile_definitions(localllm_lib PUBLIC
+        METAL_SHADER_SOURCE="${CMAKE_SOURCE_DIR}/src/kernels.metal"
+    )
 endif()
 
 # 可执行文件

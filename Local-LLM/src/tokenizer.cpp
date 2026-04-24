@@ -5,6 +5,7 @@
 #include <iostream>
 #include <locale>
 #include <sstream>
+#include <unordered_map>
 
 namespace localllm {
 
@@ -143,18 +144,46 @@ std::vector<int32_t> Tokenizer::bpe_encode(const std::string& text) const {
     }
 
     // GPT-2 / BPE 风格: 使用合并规则
-    // 初始化: 每个字符一个 token
+    // GPT-2 的字节级 BPE: 先把每个字节映射到 Unicode 字符，再做 BPE
+    static const auto& byte_map = []() -> const std::vector<std::string>& {
+        static std::vector<std::string> m(256);
+        static bool init = false;
+        if (!init) {
+            uint32_t n = 0;
+            for (int b = 0; b < 256; b++) {
+                uint32_t cp;
+                if ((b >= 0x21 && b <= 0x7E) ||
+                    (b >= 0xA1 && b <= 0xAC) ||
+                    (b >= 0xAE && b <= 0xFF)) {
+                    cp = static_cast<uint32_t>(b);
+                } else {
+                    cp = 0x0100 + n;
+                    n++;
+                }
+                // Encode Unicode codepoint to UTF-8 string
+                std::string s;
+                if (cp < 0x80) {
+                    s += (char)cp;
+                } else if (cp < 0x800) {
+                    s += (char)(0xC0 | (cp >> 6));
+                    s += (char)(0x80 | (cp & 0x3F));
+                } else {
+                    s += (char)(0xE0 | (cp >> 12));
+                    s += (char)(0x80 | ((cp >> 6) & 0x3F));
+                    s += (char)(0x80 | (cp & 0x3F));
+                }
+                m[b] = s;
+            }
+            init = true;
+        }
+        return m;
+    }();
+
+    // 将原始字节序列转换为 GPT-2 Unicode 字符序列
     std::vector<std::string> pieces;
-    for (size_t i = 0; i < text.size();) {
-        // UTF-8 字符长度
-        unsigned char c = text[i];
-        int char_len = 1;
-        if ((c & 0x80) == 0) char_len = 1;
-        else if ((c & 0xE0) == 0xC0) char_len = 2;
-        else if ((c & 0xF0) == 0xE0) char_len = 3;
-        else if ((c & 0xF8) == 0xF0) char_len = 4;
-        pieces.push_back(text.substr(i, char_len));
-        i += char_len;
+    for (size_t i = 0; i < text.size(); i++) {
+        unsigned char b = text[i];
+        pieces.push_back(byte_map[b]);
     }
 
     // 反复应用优先级最高的合并
@@ -242,71 +271,63 @@ std::string Tokenizer::decode(int32_t token_id) const {
     }
 
     // GPT2 字节级 BPE: Unicode 字符 -> 原始字节
-    // GPT2 把每个字节映射到一个 Unicode 字符:
-    //   0x21-0x7E -> 保持不变 (! 到 ~)
-    //   0xA1-0xAC -> 保持不变
-    //   0xAE-0xFF -> 保持不变
-    //   其余字节 (0x00-0x20, 0x7F-0xA0, 0xAD) -> 映射到 U+0100 开始的字符
+    // GPT2/Qwen 把每个字节(0x00-0xFF)映射到一个唯一的 Unicode 码点，
+    // decode 时需要逆映射还原。
     if (model_type_ == "gpt2") {
+        // 构建完整的逆映射表: Unicode 码点 -> 原始字节
+        static const auto& inv_map = []() -> const std::unordered_map<uint32_t, uint8_t>& {
+            static std::unordered_map<uint32_t, uint8_t> m;
+            if (m.empty()) {
+                // 复现 GPT-2 的 bytes_to_unicode():
+                // 某些字节直接映射到自身的码点，其余映射到 U+0100 开始
+                uint32_t n = 0;
+                for (int b = 0; b < 256; b++) {
+                    if ((b >= 0x21 && b <= 0x7E) ||
+                        (b >= 0xA1 && b <= 0xAC) ||
+                        (b >= 0xAE && b <= 0xFF)) {
+                        m[static_cast<uint32_t>(b)] = static_cast<uint8_t>(b);
+                    } else {
+                        m[0x0100 + n] = static_cast<uint8_t>(b);
+                        n++;
+                    }
+                }
+            }
+            return m;
+        }();
+
+        // 先解码 UTF-8 字符串为 Unicode 码点序列，再通过逆映射还原字节
         std::string result;
         size_t i = 0;
         while (i < token.size()) {
             unsigned char c = token[i];
+            uint32_t cp = 0;
+            int len = 0;
 
             if (c < 0x80) {
-                // ASCII
-                result += (char)c;
-                i++;
+                cp = c; len = 1;
             } else if ((c & 0xE0) == 0xC0 && i + 1 < token.size()) {
-                // 2-byte UTF-8
-                unsigned char c2 = token[i + 1];
-                uint32_t cp = ((c & 0x1F) << 6) | (c2 & 0x3F);
-
-                // GPT2 映射: U+0100 到 U+0143 对应字节 0x00-0x20, 0x7F-0xA0, 0xAD
-                if (cp >= 0x0100 && cp <= 0x0143) {
-                    // GPT2 的 bytes_to_unicode 映射的逆映射
-                    static const uint8_t gpt2_byte_decoder[] = {
-                        // U+0100 -> 0x00, U+0101 -> 0x01, ..., U+0120 -> 0x20
-                        0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,
-                        0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1A,0x1B,0x1C,0x1D,0x1E,0x1F,
-                        0x20, // U+0120 -> space
-                        0x7F, // U+0121 -> DEL
-                        0x80,0x81,0x82,0x83,0x84,0x85,0x86,0x87,0x88,0x89,0x8A,0x8B,0x8C,0x8D,0x8E,0x8F,
-                        0x90,0x91,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9A,0x9B,0x9C,0x9D,0x9E,0x9F,
-                        0xA0, // U+0141
-                        0xAD, // U+0142
-                        // U+0143 也映射到什么? 实际上 GPT2 只用了 0x00-0xFF 对应的 256 个 codepoint
-                    };
-                    int idx = cp - 0x0100;
-                    if (idx < (int)sizeof(gpt2_byte_decoder)) {
-                        result += (char)gpt2_byte_decoder[idx];
-                    } else {
-                        result += (char)(c);
-                        result += (char)(c2);
-                    }
-                } else {
-                    // 普通 2-byte UTF-8 字符, 保持不变
-                    result += (char)c;
-                    result += (char)c2;
-                }
-                i += 2;
+                cp = ((c & 0x1F) << 6) | (token[i+1] & 0x3F);
+                len = 2;
             } else if ((c & 0xF0) == 0xE0 && i + 2 < token.size()) {
-                // 3-byte UTF-8, 保持不变
-                result += token[i];
-                result += token[i + 1];
-                result += token[i + 2];
-                i += 3;
+                cp = ((c & 0x0F) << 12) | ((token[i+1] & 0x3F) << 6) | (token[i+2] & 0x3F);
+                len = 3;
             } else if ((c & 0xF8) == 0xF0 && i + 3 < token.size()) {
-                // 4-byte UTF-8, 保持不变
-                result += token[i];
-                result += token[i + 1];
-                result += token[i + 2];
-                result += token[i + 3];
-                i += 4;
+                cp = ((c & 0x07) << 18) | ((token[i+1] & 0x3F) << 12) | ((token[i+2] & 0x3F) << 6) | (token[i+3] & 0x3F);
+                len = 4;
             } else {
                 result += (char)c;
                 i++;
+                continue;
             }
+
+            auto it = inv_map.find(cp);
+            if (it != inv_map.end()) {
+                result += (char)it->second;
+            } else {
+                // 不在映射表中，保持原 UTF-8 编码
+                for (int j = 0; j < len; j++) result += token[i + j];
+            }
+            i += len;
         }
         return result;
     }

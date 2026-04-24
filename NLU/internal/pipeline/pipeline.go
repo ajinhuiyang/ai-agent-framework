@@ -1,12 +1,14 @@
 // Package pipeline implements the NLU pipeline engine that orchestrates
 // multiple NLU capabilities (intent, NER, slot filling, sentiment, classification)
 // and manages their execution order and data flow.
+//
+// Intent recognition, entity extraction, and sentiment analysis use a rule-based
+// engine (zero LLM calls) so that only the final answer generation needs LLM.
 package pipeline
 
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -14,9 +16,7 @@ import (
 	"github.com/your-org/nlu/internal/domain"
 	"github.com/your-org/nlu/internal/nlu/classify"
 	"github.com/your-org/nlu/internal/nlu/dialog"
-	"github.com/your-org/nlu/internal/nlu/intent"
-	"github.com/your-org/nlu/internal/nlu/ner"
-	"github.com/your-org/nlu/internal/nlu/sentiment"
+	"github.com/your-org/nlu/internal/nlu/rules"
 	"github.com/your-org/nlu/internal/nlu/slot"
 )
 
@@ -33,28 +33,24 @@ const (
 
 // Engine orchestrates the NLU pipeline.
 type Engine struct {
-	intentRecognizer  *intent.Recognizer
-	nerExtractor      *ner.Extractor
-	slotFiller        *slot.Filler
-	sentimentAnalyzer *sentiment.Analyzer
-	textClassifier    *classify.Classifier
-	dialogManager     *dialog.Manager
-	schema            *domain.DomainSchema
-	logger            *zap.Logger
-	defaultCaps       []Capability
+	rulesEngine    *rules.Engine // Rule-based: intent, NER, sentiment (instant, no LLM)
+	slotFiller     *slot.Filler  // LLM-based slot filling (only when needed)
+	textClassifier *classify.Classifier
+	dialogManager  *dialog.Manager
+	schema         *domain.DomainSchema
+	logger         *zap.Logger
+	defaultCaps    []Capability
 }
 
 // Config holds pipeline engine configuration.
 type Config struct {
-	IntentRecognizer  *intent.Recognizer
-	NERExtractor      *ner.Extractor
-	SlotFiller        *slot.Filler
-	SentimentAnalyzer *sentiment.Analyzer
-	TextClassifier    *classify.Classifier
-	DialogManager     *dialog.Manager
-	Schema            *domain.DomainSchema
-	Logger            *zap.Logger
-	DefaultCaps       []string
+	RulesEngine    *rules.Engine
+	SlotFiller     *slot.Filler
+	TextClassifier *classify.Classifier
+	DialogManager  *dialog.Manager
+	Schema         *domain.DomainSchema
+	Logger         *zap.Logger
+	DefaultCaps    []string
 }
 
 // NewEngine creates a new NLU pipeline engine.
@@ -65,15 +61,13 @@ func NewEngine(cfg Config) *Engine {
 	}
 
 	return &Engine{
-		intentRecognizer:  cfg.IntentRecognizer,
-		nerExtractor:      cfg.NERExtractor,
-		slotFiller:        cfg.SlotFiller,
-		sentimentAnalyzer: cfg.SentimentAnalyzer,
-		textClassifier:    cfg.TextClassifier,
-		dialogManager:     cfg.DialogManager,
-		schema:            cfg.Schema,
-		logger:            cfg.Logger,
-		defaultCaps:       defaultCaps,
+		rulesEngine:    cfg.RulesEngine,
+		slotFiller:     cfg.SlotFiller,
+		textClassifier: cfg.TextClassifier,
+		dialogManager:  cfg.DialogManager,
+		schema:         cfg.Schema,
+		logger:         cfg.Logger,
+		defaultCaps:    defaultCaps,
 	}
 }
 
@@ -83,6 +77,7 @@ func (e *Engine) SetSchema(schema *domain.DomainSchema) {
 }
 
 // Process runs the NLU pipeline on the given request.
+// Intent, NER, and sentiment use rule-based matching (instant, no LLM calls).
 func (e *Engine) Process(ctx context.Context, req *domain.NLURequest) (*domain.NLUResult, error) {
 	start := time.Now()
 
@@ -99,91 +94,47 @@ func (e *Engine) Process(ctx context.Context, req *domain.NLURequest) (*domain.N
 	)
 
 	// Get dialog context if session ID is provided
-	var dialogHistory string
 	if req.SessionID != "" && e.dialogManager != nil {
 		_ = e.dialogManager.GetOrCreateSession(req.SessionID)
-		dialogHistory = e.dialogManager.GetDialogHistory(req.SessionID)
 	}
 
-	// Determine which capabilities can run in parallel vs sequentially
-	// Phase 1 (parallel): intent, ner, sentiment, classify
-	// Phase 2 (depends on intent): slot filling
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-
-	// Phase 1: Run independent capabilities in parallel
+	// Run rule-based capabilities (instant, no LLM)
 	for _, cap := range caps {
 		switch cap {
 		case CapIntent:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				intentResult, err := e.intentRecognizer.Recognize(ctx, req.Text, e.schema, dialogHistory)
-				mu.Lock()
-				defer mu.Unlock()
-				if err != nil {
-					e.logger.Error("intent recognition failed", zap.Error(err))
-					result.Errors = append(result.Errors, fmt.Sprintf("intent: %v", err))
-				} else {
-					result.Intent = intentResult
-				}
-			}()
+			if e.rulesEngine != nil {
+				result.Intent = e.rulesEngine.RecognizeIntent(req.Text)
+			}
 
 		case CapNER:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				nerResult, err := e.nerExtractor.Extract(ctx, req.Text, e.schema, req.Language)
-				mu.Lock()
-				defer mu.Unlock()
-				if err != nil {
-					e.logger.Error("NER failed", zap.Error(err))
-					result.Errors = append(result.Errors, fmt.Sprintf("ner: %v", err))
-				} else {
-					result.Entities = nerResult
-				}
-			}()
+			if e.rulesEngine != nil {
+				result.Entities = e.rulesEngine.ExtractEntities(req.Text)
+			}
 
 		case CapSentiment:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				sentResult, err := e.sentimentAnalyzer.Analyze(ctx, req.Text, req.Language)
-				mu.Lock()
-				defer mu.Unlock()
-				if err != nil {
-					e.logger.Error("sentiment analysis failed", zap.Error(err))
-					result.Errors = append(result.Errors, fmt.Sprintf("sentiment: %v", err))
-				} else {
-					result.Sentiment = sentResult
-				}
-			}()
+			if e.rulesEngine != nil {
+				result.Sentiment = e.rulesEngine.AnalyzeSentiment(req.Text)
+			}
 
 		case CapClassify:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			if e.textClassifier != nil {
 				categories := e.getCategories(req)
 				classResult, err := e.textClassifier.Classify(ctx, &classify.ClassifyRequest{
 					Text:       req.Text,
 					Categories: categories,
 					MultiLabel: req.ClassifyConfig != nil && req.ClassifyConfig.MultiLabel,
 				})
-				mu.Lock()
-				defer mu.Unlock()
 				if err != nil {
 					e.logger.Error("text classification failed", zap.Error(err))
 					result.Errors = append(result.Errors, fmt.Sprintf("classify: %v", err))
 				} else {
 					result.Classification = classResult
 				}
-			}()
+			}
 		}
 	}
 
-	wg.Wait()
-
-	// Phase 2: Slot filling (depends on intent result)
+	// Slot filling (depends on intent result, may use LLM)
 	if containsCap(caps, CapSlot) && e.slotFiller != nil {
 		intentName := ""
 		if result.Intent != nil {
@@ -192,11 +143,15 @@ func (e *Engine) Process(ctx context.Context, req *domain.NLURequest) (*domain.N
 
 		slots := e.getSlotDefinitions(req, intentName)
 		if len(slots) > 0 {
-			// Get existing filled slots from dialog context
 			var filledSlots map[string]domain.SlotValue
 			if req.SessionID != "" && e.dialogManager != nil {
 				state := e.dialogManager.GetDialogState(req.SessionID)
 				filledSlots = state.FilledSlots
+			}
+
+			dialogHistory := ""
+			if req.SessionID != "" && e.dialogManager != nil {
+				dialogHistory = e.dialogManager.GetDialogHistory(req.SessionID)
 			}
 
 			slotResult, err := e.slotFiller.Fill(ctx, &slot.FillRequest{
@@ -212,7 +167,6 @@ func (e *Engine) Process(ctx context.Context, req *domain.NLURequest) (*domain.N
 			} else {
 				result.SlotFilling = slotResult
 
-				// Update dialog slots
 				if req.SessionID != "" && e.dialogManager != nil {
 					e.dialogManager.UpdateSlots(req.SessionID, slotResult.FilledSlots)
 				}
@@ -228,7 +182,7 @@ func (e *Engine) Process(ctx context.Context, req *domain.NLURequest) (*domain.N
 
 	result.ProcessingTime = time.Since(start).Milliseconds()
 
-	e.logger.Info("NLU processing complete",
+	e.logger.Info("NLU processing complete (rule-based)",
 		zap.Int64("processing_time_ms", result.ProcessingTime),
 		zap.Int("error_count", len(result.Errors)),
 	)
@@ -244,30 +198,9 @@ func (e *Engine) resolveCaps(requested []string) []Capability {
 
 	caps := make([]Capability, 0, len(requested))
 	for _, r := range requested {
-		cap := Capability(r)
-		if e.isCapAvailable(cap) {
-			caps = append(caps, cap)
-		}
+		caps = append(caps, Capability(r))
 	}
 	return caps
-}
-
-// isCapAvailable checks if a capability's handler is configured.
-func (e *Engine) isCapAvailable(cap Capability) bool {
-	switch cap {
-	case CapIntent:
-		return e.intentRecognizer != nil
-	case CapNER:
-		return e.nerExtractor != nil
-	case CapSlot:
-		return e.slotFiller != nil
-	case CapSentiment:
-		return e.sentimentAnalyzer != nil
-	case CapClassify:
-		return e.textClassifier != nil
-	default:
-		return false
-	}
 }
 
 // getCategories resolves classification categories from request or schema.
@@ -283,16 +216,13 @@ func (e *Engine) getCategories(req *domain.NLURequest) []string {
 
 // getSlotDefinitions resolves slot definitions from request or schema.
 func (e *Engine) getSlotDefinitions(req *domain.NLURequest, intentName string) []domain.SlotDefinition {
-	// First check request-level slot config
 	if req.SlotConfig != nil && len(req.SlotConfig.SlotDefinitions) > 0 {
 		return req.SlotConfig.SlotDefinitions
 	}
 
-	// Then check schema for intent-specific slots
 	if e.schema != nil && intentName != "" {
 		for _, intentSchema := range e.schema.Intents {
 			if intentSchema.Name == intentName && len(intentSchema.Slots) > 0 {
-				// Find matching slot definitions
 				var slots []domain.SlotDefinition
 				for _, slotName := range intentSchema.Slots {
 					for _, sd := range e.schema.SlotDefinitions {
@@ -306,7 +236,6 @@ func (e *Engine) getSlotDefinitions(req *domain.NLURequest, intentName string) [
 		}
 	}
 
-	// Fall back to all schema slot definitions
 	if e.schema != nil {
 		return e.schema.SlotDefinitions
 	}

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"time"
 
 	goai "github.com/sashabaranov/go-openai"
 
@@ -26,6 +28,10 @@ func New(apiKey, baseURL, model, name string) *Provider {
 	config := goai.DefaultConfig(apiKey)
 	if baseURL != "" {
 		config.BaseURL = baseURL
+	}
+	// Local LLM inference can take minutes; set a generous timeout.
+	config.HTTPClient = &http.Client{
+		Timeout: 10 * time.Minute,
 	}
 	if name == "" {
 		name = "openai"

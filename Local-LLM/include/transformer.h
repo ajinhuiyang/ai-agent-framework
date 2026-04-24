@@ -97,7 +97,8 @@ public:
                          int max_tokens = 256,
                          float temperature = 0.7f,
                          float top_p = 0.9f,
-                         TokenCallback callback = nullptr);
+                         TokenCallback callback = nullptr,
+                         const std::string& system_prompt = "");
 
     // 清除 KV cache (开始新对话)
     void reset();
@@ -107,14 +108,23 @@ public:
     const ModelConfig& config() const { return config_; }
 
 private:
-    // 单层 Transformer 前向传播
+    // 单层 Transformer 前向传播 (单 token, decode 阶段)
     void forward_layer(int layer, float* x, int32_t pos);
 
-    // Attention 前向
+    // Attention 前向 (单 token)
     void forward_attention(int layer, float* x, float* x_out, int32_t pos);
 
-    // FFN 前向 (SwiGLU)
+    // FFN 前向 (SwiGLU, 单 token)
     void forward_ffn(int layer, float* x, float* x_out);
+
+    // ---- Batch 前向 (多 token, prefill 阶段) ----
+    // X: [hidden_size, seq_len] 列主序, pos_start: 起始位置
+    void forward_layer_batch(int layer, float* X, int64_t seq_len, int32_t pos_start);
+    void forward_attention_batch(int layer, float* X, float* X_out, int64_t seq_len, int32_t pos_start);
+    void forward_ffn_batch(int layer, float* X, float* X_out, int64_t seq_len);
+
+    // Batch prefill: 处理所有 prompt tokens, 返回最后一个 token 的 logits
+    std::vector<float> forward_batch(const std::vector<int32_t>& tokens, int32_t pos_start);
 
     ModelConfig config_;
     ModelWeights weights_;
@@ -136,6 +146,15 @@ private:
     std::vector<float> q_buf_;
     std::vector<float> k_buf_;
     std::vector<float> v_buf_;
+
+    // Batch prefill 临时 buffer (按需分配)
+    std::vector<float> batch_x_buf_;   // [hidden_size * seq_len]
+    std::vector<float> batch_x_buf2_;  // [hidden_size * seq_len]
+    std::vector<float> batch_q_buf_;   // [num_heads * head_dim * seq_len]
+    std::vector<float> batch_k_buf_;   // [num_kv_heads * head_dim * seq_len]
+    std::vector<float> batch_v_buf_;   // [num_kv_heads * head_dim * seq_len]
+    std::vector<float> batch_ffn1_;    // [intermediate_size * seq_len]
+    std::vector<float> batch_ffn2_;    // [intermediate_size * seq_len]
 };
 
 } // namespace localllm

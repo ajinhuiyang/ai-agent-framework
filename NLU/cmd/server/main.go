@@ -20,16 +20,15 @@ import (
 	"github.com/your-org/nlu/internal/client"
 	"github.com/your-org/nlu/internal/config"
 	"github.com/your-org/nlu/internal/domain"
+	"github.com/your-org/nlu/internal/nlu/dialog"
+	"github.com/your-org/nlu/internal/nlu/rules"
+	"github.com/your-org/nlu/internal/nlu/slot"
+	"github.com/your-org/nlu/internal/pipeline"
+
+	// LLM provider still needed for slot filling and dialog
 	"github.com/your-org/nlu/internal/llm"
 	llmollama "github.com/your-org/nlu/internal/llm/ollama"
 	llmopenai "github.com/your-org/nlu/internal/llm/openai"
-	"github.com/your-org/nlu/internal/nlu/classify"
-	"github.com/your-org/nlu/internal/nlu/dialog"
-	"github.com/your-org/nlu/internal/nlu/intent"
-	"github.com/your-org/nlu/internal/nlu/ner"
-	"github.com/your-org/nlu/internal/nlu/sentiment"
-	"github.com/your-org/nlu/internal/nlu/slot"
-	"github.com/your-org/nlu/internal/pipeline"
 	"github.com/your-org/nlu/internal/prompt"
 )
 
@@ -54,19 +53,9 @@ func main() {
 	defer logger.Sync()
 
 	logger.Info("starting NLU service",
-		zap.String("provider", cfg.LLM.Provider),
+		zap.String("mode", "rule-based NLU + LLM generation"),
 		zap.Int("port", cfg.Server.Port),
 	)
-
-	// Initialize LLM provider
-	provider, err := initLLMProvider(cfg.LLM)
-	if err != nil {
-		logger.Fatal("failed to initialize LLM provider", zap.Error(err))
-	}
-	logger.Info("LLM provider initialized", zap.String("provider", provider.Name()))
-
-	// Initialize prompt manager
-	promptManager := prompt.NewManager()
 
 	// Load domain schema from domain.yaml
 	var domainSchema *domain.DomainSchema
@@ -96,25 +85,32 @@ func main() {
 		}
 	}
 
-	// Initialize NLU modules
-	intentRecognizer := intent.New(provider, promptManager, logger)
-	nerExtractor := ner.New(provider, promptManager, logger)
-	slotFiller := slot.New(provider, promptManager, logger)
-	sentimentAnalyzer := sentiment.New(provider, promptManager, logger)
-	textClassifier := classify.New(provider, promptManager, logger)
-	dialogManager := dialog.New(provider, promptManager, logger, cfg.NLU.MaxDialogTurns)
+	// Initialize rule-based NLU engine (intent + NER + sentiment — zero LLM calls)
+	rulesEngine := rules.New(domainSchema, logger)
+	logger.Info("rule-based NLU engine initialized (no LLM needed for intent/NER/sentiment)")
 
-	// Initialize NLU pipeline engine
+	// Initialize LLM provider (only needed for slot filling and dialog)
+	provider, err := initLLMProvider(cfg.LLM)
+	if err != nil {
+		logger.Warn("LLM provider init failed, slot filling will be unavailable", zap.Error(err))
+	}
+
+	// Initialize modules that still need LLM
+	promptManager := prompt.NewManager()
+	var slotFiller *slot.Filler
+	var dialogManager *dialog.Manager
+	if provider != nil {
+		slotFiller = slot.New(provider, promptManager, logger)
+		dialogManager = dialog.New(provider, promptManager, logger, cfg.NLU.MaxDialogTurns)
+	}
+
+	// Initialize NLU pipeline engine (rule-based for core NLU)
 	engine := pipeline.NewEngine(pipeline.Config{
-		IntentRecognizer:  intentRecognizer,
-		NERExtractor:      nerExtractor,
-		SlotFiller:        slotFiller,
-		SentimentAnalyzer: sentimentAnalyzer,
-		TextClassifier:    textClassifier,
-		DialogManager:     dialogManager,
-		Schema:            domainSchema,
-		Logger:            logger,
-		DefaultCaps:       cfg.NLU.DefaultCapabilities,
+		RulesEngine: rulesEngine,
+		SlotFiller:  slotFiller,
+		Schema:      domainSchema,
+		Logger:      logger,
+		DefaultCaps: cfg.NLU.DefaultCapabilities,
 	})
 
 	// Initialize HTTP clients for peer services
@@ -178,7 +174,6 @@ func initLogger(cfg config.LoggingConfig) (*zap.Logger, error) {
 		zapCfg = zap.NewProductionConfig()
 	}
 
-	// Set log level
 	switch cfg.Level {
 	case "debug":
 		zapCfg.Level = zap.NewAtomicLevelAt(zapcore.DebugLevel)

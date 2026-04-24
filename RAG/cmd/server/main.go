@@ -21,6 +21,7 @@ import (
 	"github.com/your-org/rag/internal/api"
 	"github.com/your-org/rag/internal/api/handler"
 	"github.com/your-org/rag/internal/config"
+	embeddingLocal "github.com/your-org/rag/internal/embedding/local"
 	embeddingOllama "github.com/your-org/rag/internal/embedding/ollama"
 	embeddingOpenAI "github.com/your-org/rag/internal/embedding/openai"
 	"github.com/your-org/rag/internal/retriever"
@@ -72,6 +73,8 @@ func main() {
 			cfg.Embedding.Ollama.Model,
 			cfg.Embedding.Ollama.Dimension,
 		)
+	case "local":
+		embedder = embeddingLocal.New(cfg.Embedding.Local.Dimension)
 	default:
 		log.Fatalf("unsupported embedding provider: %s", cfg.Embedding.Provider)
 	}

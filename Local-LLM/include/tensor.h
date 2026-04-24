@@ -18,6 +18,10 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
+#ifdef USE_METAL
+#include "metal_compute.h"
+#endif
+
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
@@ -257,6 +261,9 @@ private:
 // ======================== 基础线性代数 ========================
 
 inline void mat_vec_mul(const float* A, const float* x, float* y, int64_t m, int64_t n) {
+#ifdef USE_METAL
+    if (MetalContext::instance().mat_vec_mul_f32(A, x, y, m, n)) return;
+#endif
 #ifdef USE_ACCELERATE
     cblas_sgemv(CblasRowMajor, CblasNoTrans, (int)m, (int)n,
                 1.0f, A, (int)n, x, 1, 0.0f, y, 1);
@@ -279,6 +286,15 @@ inline void mat_vec_mul_tensor(const Tensor& W, const float* x, float* y, int64_
         return;
     }
 
+#ifdef USE_METAL
+    // 优先尝试 GPU
+    if (MetalContext::instance().mat_vec_mul(
+            W.quant_row_data(0), x, y, m, n, W.type())) {
+        return;
+    }
+    // GPU 不支持此量化类型或执行失败, fallback 到 CPU
+#endif
+
     GGMLType wtype = W.type();
     // 检查是否有融合 dot product 实现
     bool has_fused = (wtype == GGMLType::Q4_K || wtype == GGMLType::Q6_K ||
@@ -300,6 +316,75 @@ inline void mat_vec_mul_tensor(const Tensor& W, const float* x, float* y, int64_
                 float sum = 0.0f;
                 for (int64_t j = 0; j < n; ++j) sum += buf[j] * x[j];
                 y[i] = sum;
+#endif
+            }
+        }
+    });
+}
+
+// ======================== Batch 矩阵乘法 (Prefill 加速) ========================
+// Y[m, seq_len] = W[m, n] @ X[n, seq_len]
+// W: 权重矩阵 (可量化), X: 多个 token 的输入 (列主序), Y: 输出 (列主序)
+// 将多个 mat-vec-mul 合并为一个 mat-mat-mul, 大幅提升 prefill 吞吐
+
+// Float 矩阵乘法: Y[m, k] = A[m, n] @ B[n, k]
+// A: row-major [m x n], B: column-major [n x k], Y: column-major [m x k]
+inline void mat_mat_mul(const float* A, const float* B, float* Y,
+                        int64_t m, int64_t n, int64_t k) {
+#ifdef USE_ACCELERATE
+    // cblas_sgemm: C = alpha * A @ B + beta * C
+    // A: row-major [m x n], B: col-major [n x k], C: col-major [m x k]
+    cblas_sgemm(CblasColMajor, CblasNoTrans, CblasNoTrans,
+                (int)m, (int)k, (int)n,
+                1.0f, A, (int)m, B, (int)n,
+                0.0f, Y, (int)m);
+#else
+    // Naive fallback: 逐列计算 Y[:,j] = A @ B[:,j]
+    for (int64_t j = 0; j < k; ++j) {
+        const float* b_col = B + j * n;
+        float* y_col = Y + j * m;
+        for (int64_t i = 0; i < m; ++i) {
+            float sum = 0.0f;
+            const float* a_row = A + i * n;
+            for (int64_t p = 0; p < n; ++p) sum += a_row[p] * b_col[p];
+            y_col[i] = sum;
+        }
+    }
+#endif
+}
+
+// 量化权重的 batch mat-mul: Y[m, seq_len] = W_quant[m, n] @ X[n, seq_len]
+// 对每一列 (token) 做量化 mat-vec-mul, 利用线程池并行化
+// 比逐 token 串行快, 因为所有 token 的同一行可以共享反量化结果
+inline void mat_mat_mul_tensor(const Tensor& W, const float* X, float* Y,
+                               int64_t m, int64_t n, int64_t seq_len) {
+    if (seq_len == 1) {
+        // 单 token: 直接走优化过的 mat-vec-mul
+        mat_vec_mul_tensor(W, X, Y, m, n);
+        return;
+    }
+
+    if (!W.is_quantized()) {
+        // Float 权重: 直接用 BLAS mat-mat-mul
+        mat_mat_mul(W.data(), X, Y, m, n, seq_len);
+        return;
+    }
+
+    // 量化权重: 先反量化每行, 然后一次性处理所有 seq_len 个 token
+    // 这比逐 token 分别调 mat_vec_mul_tensor 快, 因为反量化只做一次
+    ThreadPool::instance().parallel_for(m, [&](int64_t row_start, int64_t row_end) {
+        std::vector<float> row_buf(n);
+        for (int64_t i = row_start; i < row_end; ++i) {
+            W.dequant_row(i, row_buf.data());
+            for (int64_t j = 0; j < seq_len; ++j) {
+                const float* x_col = X + j * n;  // 第 j 个 token
+                float* y_col = Y + j * m;        // 第 j 个输出
+#ifdef USE_ACCELERATE
+                vDSP_dotpr(row_buf.data(), 1, x_col, 1, &y_col[i], (vDSP_Length)n);
+#else
+                float sum = 0.0f;
+                for (int64_t p = 0; p < n; ++p) sum += row_buf[p] * x_col[p];
+                y_col[i] = sum;
 #endif
             }
         }

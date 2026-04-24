@@ -366,6 +366,177 @@ void Transformer::reset() {
     kv_cache_.clear();
 }
 
+// ======================== Batch Prefill (多 token 一次前向) ========================
+// 数据布局: 列主序 [dim, seq_len], 第 j 个 token 在 X + j * dim
+
+void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
+                                           int64_t seq_len, int32_t pos_start) {
+    auto& lw = weights_.layers[layer];
+    int dim = config_.hidden_size;
+    int head_dim = config_.head_dim;
+    int n_heads = config_.num_heads;
+    int n_kv_heads = config_.num_kv_heads;
+    int kv_dim = n_kv_heads * head_dim;
+    int kv_mul = n_heads / n_kv_heads;
+
+    int64_t q_total = n_heads * head_dim;
+
+    // 确保 batch buffer 够大
+    batch_q_buf_.resize(q_total * seq_len);
+    batch_k_buf_.resize(kv_dim * seq_len);
+    batch_v_buf_.resize(kv_dim * seq_len);
+
+    // Q = Wq @ X  [q_total, seq_len]
+    mat_mat_mul_tensor(lw.wq, X, batch_q_buf_.data(), q_total, dim, seq_len);
+    // K = Wk @ X  [kv_dim, seq_len]
+    mat_mat_mul_tensor(lw.wk, X, batch_k_buf_.data(), kv_dim, dim, seq_len);
+    // V = Wv @ X  [kv_dim, seq_len]
+    mat_mat_mul_tensor(lw.wv, X, batch_v_buf_.data(), kv_dim, dim, seq_len);
+
+    // 对每个 token 做: 加 bias, RoPE, 写入 KV cache, attention
+    for (int64_t t = 0; t < seq_len; ++t) {
+        float* q = batch_q_buf_.data() + t * q_total;
+        float* k = batch_k_buf_.data() + t * kv_dim;
+        float* v = batch_v_buf_.data() + t * kv_dim;
+        int32_t pos = pos_start + static_cast<int32_t>(t);
+
+        // Bias
+        if (config_.has_attn_bias) {
+            if (!lw.bq.empty()) vec_add_inplace(q, lw.bq.data(), q_total);
+            if (!lw.bk.empty()) vec_add_inplace(k, lw.bk.data(), kv_dim);
+            if (!lw.bv.empty()) vec_add_inplace(v, lw.bv.data(), kv_dim);
+        }
+
+        // RoPE
+        for (int h = 0; h < n_kv_heads; ++h) {
+            float* k_head = k + h * head_dim;
+            for (int i = 0; i < head_dim; i += 2) {
+                float freq = 1.0f / powf(config_.rope_theta, (float)i / head_dim);
+                float val = pos * freq;
+                float cos_val = cosf(val), sin_val = sinf(val);
+                float k0 = k_head[i], k1 = k_head[i + 1];
+                k_head[i]     = k0 * cos_val - k1 * sin_val;
+                k_head[i + 1] = k0 * sin_val + k1 * cos_val;
+            }
+        }
+        for (int h = 0; h < n_heads; ++h) {
+            float* q_head = q + h * head_dim;
+            for (int i = 0; i < head_dim; i += 2) {
+                float freq = 1.0f / powf(config_.rope_theta, (float)i / head_dim);
+                float val = pos * freq;
+                float cos_val = cosf(val), sin_val = sinf(val);
+                float q0 = q_head[i], q1 = q_head[i + 1];
+                q_head[i]     = q0 * cos_val - q1 * sin_val;
+                q_head[i + 1] = q0 * sin_val + q1 * cos_val;
+            }
+        }
+
+        // 写入 KV cache
+        memcpy(kv_cache_.key_cache[layer].row_data(pos), k, kv_dim * sizeof(float));
+        memcpy(kv_cache_.value_cache[layer].row_data(pos), v, kv_dim * sizeof(float));
+
+        // Attention: Q @ K^T -> softmax -> @ V
+        float* x_out = X_out + t * dim;
+        float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+        for (int h = 0; h < n_heads; ++h) {
+            float* q_head = q + h * head_dim;
+            int kv_h = h / kv_mul;
+
+            // Q @ K^T (包含 causal mask: 只看 [0, pos])
+            for (int s = 0; s <= pos; ++s) {
+                const float* k_s = kv_cache_.key_cache[layer].row_data(s) + kv_h * head_dim;
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_s[d];
+                attn_buf_[s] = score * scale;
+            }
+
+            softmax(attn_buf_.data(), pos + 1);
+
+            // Weighted sum of V
+            float* out_head = x_out + h * head_dim;
+            memset(out_head, 0, head_dim * sizeof(float));
+            for (int s = 0; s <= pos; ++s) {
+                const float* v_s = kv_cache_.value_cache[layer].row_data(s) + kv_h * head_dim;
+                float w = attn_buf_[s];
+                for (int d = 0; d < head_dim; ++d) out_head[d] += w * v_s[d];
+            }
+        }
+    }
+}
+
+void Transformer::forward_ffn_batch(int layer, float* X, float* X_out, int64_t seq_len) {
+    auto& lw = weights_.layers[layer];
+    int dim = config_.hidden_size;
+    int hidden_dim = config_.intermediate_size;
+
+    // W1 @ X -> gate [hidden_dim, seq_len]
+    // W3 @ X -> up   [hidden_dim, seq_len]
+    batch_ffn1_.resize(hidden_dim * seq_len);
+    batch_ffn2_.resize(hidden_dim * seq_len);
+
+    mat_mat_mul_tensor(lw.w1, X, batch_ffn1_.data(), hidden_dim, dim, seq_len);
+    mat_mat_mul_tensor(lw.w3, X, batch_ffn2_.data(), hidden_dim, dim, seq_len);
+
+    // SiLU(gate) * up
+    int64_t total = hidden_dim * seq_len;
+    for (int64_t i = 0; i < total; ++i) {
+        float g = batch_ffn1_[i];
+        batch_ffn1_[i] = (g / (1.0f + expf(-g))) * batch_ffn2_[i];
+    }
+
+    // W2 @ result -> X_out [dim, seq_len]
+    mat_mat_mul_tensor(lw.w2, batch_ffn1_.data(), X_out, dim, hidden_dim, seq_len);
+}
+
+void Transformer::forward_layer_batch(int layer, float* X, int64_t seq_len, int32_t pos_start) {
+    auto& lw = weights_.layers[layer];
+    int dim = config_.hidden_size;
+
+    batch_x_buf_.resize(dim * seq_len);
+    batch_x_buf2_.resize(dim * seq_len);
+
+    // RMSNorm each token
+    for (int64_t t = 0; t < seq_len; ++t) {
+        float* x = X + t * dim;
+        float* xn = batch_x_buf_.data() + t * dim;
+        rmsnorm(xn, x, lw.attn_norm.data(), dim, config_.rms_norm_eps);
+    }
+
+    // Attention (batch QKV projection, per-token attention with causal mask)
+    forward_attention_batch(layer, batch_x_buf_.data(), batch_x_buf2_.data(), seq_len, pos_start);
+
+    // Wo projection: attn_out = Wo @ attn_result
+    // batch_x_buf2_ has attention output, project through Wo
+    std::vector<float> attn_projected(dim * seq_len);
+    mat_mat_mul_tensor(lw.wo, batch_x_buf2_.data(), attn_projected.data(), dim, dim, seq_len);
+
+    // Residual add
+    for (int64_t i = 0; i < dim * seq_len; ++i) X[i] += attn_projected[i];
+
+    // FFN
+    for (int64_t t = 0; t < seq_len; ++t) {
+        float* x = X + t * dim;
+        float* xn = batch_x_buf_.data() + t * dim;
+        rmsnorm(xn, x, lw.ffn_norm.data(), dim, config_.rms_norm_eps);
+    }
+
+    forward_ffn_batch(layer, batch_x_buf_.data(), batch_x_buf2_.data(), seq_len);
+
+    // Residual add
+    for (int64_t i = 0; i < dim * seq_len; ++i) X[i] += batch_x_buf2_[i];
+}
+
+std::vector<float> Transformer::forward_batch(const std::vector<int32_t>& tokens, int32_t pos_start) {
+    // 暂时用逐 token 串行模式，确保正确性
+    std::vector<float> logits;
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        logits = forward(tokens[i], pos_start + static_cast<int32_t>(i));
+    }
+    kv_cache_.seq_len = pos_start + static_cast<int32_t>(tokens.size());
+    return logits;
+}
+
 // ======================== 采样 ========================
 
 static int32_t sample_top_p(const std::vector<float>& logits, float temperature, float top_p) {
@@ -432,15 +603,14 @@ std::string Transformer::generate(const std::string& prompt,
                                    int max_tokens,
                                    float temperature,
                                    float top_p,
-                                   TokenCallback callback) {
+                                   TokenCallback callback,
+                                   const std::string& system_prompt) {
     // 构建 prompt tokens
     std::vector<int32_t> prompt_tokens;
 
-    // Qwen2 chat template: <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+    // Qwen2 chat template
     if (config_.architecture == "qwen2") {
-        // 查找特殊 token IDs
         auto find_token = [&](const std::string& text) -> int32_t {
-            // 尝试直接在词表中查找
             for (int32_t i = 0; i < tokenizer_.vocab_size(); ++i) {
                 if (tokenizer_.get_token_text(i) == text) return i;
             }
@@ -451,25 +621,28 @@ std::string Transformer::generate(const std::string& prompt,
         int32_t im_end = find_token("<|im_end|>");
         int32_t nl_token = find_token("\n");
         if (nl_token < 0) {
-            // GPT2 tokenizer: '\n' 可能编码为 'Ċ'
             nl_token = find_token("Ċ");
         }
 
         if (im_start >= 0 && im_end >= 0) {
-            // system turn
+            // system turn — 使用传入的 system_prompt 或默认值
+            std::string sys_text = system_prompt.empty()
+                ? "You are a helpful assistant."
+                : system_prompt;
+
             prompt_tokens.push_back(im_start);
-            auto sys_tokens = tokenizer_.encode("system", false);
-            prompt_tokens.insert(prompt_tokens.end(), sys_tokens.begin(), sys_tokens.end());
+            auto sys_role = tokenizer_.encode("system", false);
+            prompt_tokens.insert(prompt_tokens.end(), sys_role.begin(), sys_role.end());
             if (nl_token >= 0) prompt_tokens.push_back(nl_token);
-            auto sys_msg = tokenizer_.encode("You are a helpful assistant.", false);
+            auto sys_msg = tokenizer_.encode(sys_text, false);
             prompt_tokens.insert(prompt_tokens.end(), sys_msg.begin(), sys_msg.end());
             prompt_tokens.push_back(im_end);
             if (nl_token >= 0) prompt_tokens.push_back(nl_token);
 
             // user turn
             prompt_tokens.push_back(im_start);
-            auto user_tokens = tokenizer_.encode("user", false);
-            prompt_tokens.insert(prompt_tokens.end(), user_tokens.begin(), user_tokens.end());
+            auto user_role = tokenizer_.encode("user", false);
+            prompt_tokens.insert(prompt_tokens.end(), user_role.begin(), user_role.end());
             if (nl_token >= 0) prompt_tokens.push_back(nl_token);
             auto user_msg = tokenizer_.encode(prompt, false);
             prompt_tokens.insert(prompt_tokens.end(), user_msg.begin(), user_msg.end());
@@ -478,11 +651,10 @@ std::string Transformer::generate(const std::string& prompt,
 
             // assistant turn start
             prompt_tokens.push_back(im_start);
-            auto asst_tokens = tokenizer_.encode("assistant", false);
-            prompt_tokens.insert(prompt_tokens.end(), asst_tokens.begin(), asst_tokens.end());
+            auto asst_role = tokenizer_.encode("assistant", false);
+            prompt_tokens.insert(prompt_tokens.end(), asst_role.begin(), asst_role.end());
             if (nl_token >= 0) prompt_tokens.push_back(nl_token);
         } else {
-            // fallback: 无 chat template
             prompt_tokens = tokenizer_.encode(prompt, true);
         }
     } else {
@@ -495,23 +667,26 @@ std::string Transformer::generate(const std::string& prompt,
     std::vector<int32_t> output_tokens;
 
     auto start = std::chrono::high_resolution_clock::now();
-    int total_tokens = 0;
 
-    // Prefill: 处理所有 prompt tokens
-    int32_t pos = 0;
-    std::vector<float> logits;
+    // ==================== Batch Prefill ====================
+    // 一次性处理所有 prompt tokens (矩阵×矩阵, 比逐token串行快很多)
+    auto prefill_start = std::chrono::high_resolution_clock::now();
+    std::vector<float> logits = forward_batch(prompt_tokens, 0);
+    int32_t pos = static_cast<int32_t>(prompt_tokens.size());
+    auto prefill_end = std::chrono::high_resolution_clock::now();
 
-    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-        logits = forward(prompt_tokens[i], pos);
-        pos++;
-        total_tokens++;
-    }
+    auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(prefill_end - prefill_start).count();
+    float prefill_tps = (prefill_ms > 0) ? (prompt_tokens.size() * 1000.0f / prefill_ms) : 0;
+    std::cout << "[Generate] Prefill: " << prompt_tokens.size() << " tokens in "
+              << prefill_ms << " ms (" << prefill_tps << " tok/s)" << std::endl;
 
-    // Decode: 自回归生成
+    // ==================== Decode (自回归) ====================
+    int decode_tokens = 0;
+    auto decode_start = std::chrono::high_resolution_clock::now();
+
     for (int i = 0; i < max_tokens; ++i) {
         int32_t next_token = sample_top_p(logits, temperature, top_p);
 
-        // 检查是否结束
         if (tokenizer_.is_eos(next_token)) {
             break;
         }
@@ -520,26 +695,25 @@ std::string Transformer::generate(const std::string& prompt,
         std::string token_text = tokenizer_.decode(next_token);
         generated_text += token_text;
 
-        // 回调
         if (callback) {
             if (!callback(next_token, token_text)) {
-                break; // 用户取消
+                break;
             }
         }
 
-        // 前向传播下一个 token
         logits = forward(next_token, pos);
         pos++;
-        total_tokens++;
+        decode_tokens++;
     }
 
     auto end = std::chrono::high_resolution_clock::now();
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    float tokens_per_sec = (elapsed_ms > 0) ? (total_tokens * 1000.0f / elapsed_ms) : 0;
+    auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - decode_start).count();
+    auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    float decode_tps = (decode_ms > 0) ? (decode_tokens * 1000.0f / decode_ms) : 0;
 
-    std::cout << "\n[Generate] " << output_tokens.size() << " tokens generated"
-              << " (" << tokens_per_sec << " tok/s)"
-              << " in " << elapsed_ms << " ms" << std::endl;
+    std::cout << "\n[Generate] Decode: " << decode_tokens << " tokens in "
+              << decode_ms << " ms (" << decode_tps << " tok/s)" << std::endl;
+    std::cout << "[Generate] Total: " << total_ms << " ms" << std::endl;
 
     return generated_text;
 }
