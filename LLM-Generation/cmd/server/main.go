@@ -106,8 +106,10 @@ func main() {
 
 	// Create orchestrator.
 	defaultConfig := domain.GenerateConfig{
-		Temperature: cfg.LLM.Temperature,
-		MaxTokens:   cfg.LLM.MaxTokens,
+		Temperature:       cfg.LLM.Temperature,
+		MaxTokens:         cfg.LLM.MaxTokens,
+		TopP:              cfg.LLM.TopP,
+		RepetitionPenalty: cfg.LLM.RepetitionPenalty,
 	}
 
 	orch := orchestrator.New(

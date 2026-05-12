@@ -88,6 +88,7 @@ type StreamChunk struct {
 	Content      string `json:"content"`
 	Done         bool   `json:"done"`
 	FinishReason string `json:"finish_reason,omitempty"`
+	FullContent  string `json:"full_content,omitempty"` // 仅在 Done=true 时设置，包含修复后的完整内容
 }
 
 // Usage tracks token consumption.

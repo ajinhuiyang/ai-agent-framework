@@ -97,9 +97,10 @@ public:
         std::string text;
         int prompt_tokens = 0;
         int completion_tokens = 0;
+        std::string finish_reason = "stop";  // "stop" = normal EOS, "length" = max_tokens reached
     };
     GenerateResult generate(const std::string& prompt,
-                         int max_tokens = 2048,
+                         int max_tokens = 8192,
                          float temperature = 0.7f,
                          float top_p = 0.9f,
                          TokenCallback callback = nullptr,
@@ -114,6 +115,10 @@ public:
     const ModelConfig& config() const { return config_; }
 
 private:
+    // 采样: 复用内部 buffer 避免每次分配
+    int32_t sample_top_p(std::vector<float>& logits, float temperature, float top_p,
+                         const std::vector<int32_t>& output_tokens, float repetition_penalty);
+
     // 单层 Transformer 前向传播 (单 token, decode 阶段)
     void forward_layer(int layer, float* x, int32_t pos);
 
@@ -166,6 +171,21 @@ private:
 
     // RoPE 预计算频率表 [head_dim/2]
     std::vector<float> rope_freq_;
+
+    // RoPE 预计算 cos/sin 查找表 [context_len * head_dim/2]
+    // rope_cos_[pos * half_dim + i] = cosf(pos * rope_freq_[i])
+    // rope_sin_[pos * half_dim + i] = sinf(pos * rope_freq_[i])
+    std::vector<float> rope_cos_;
+    std::vector<float> rope_sin_;
+
+    // 采样复用 buffer (避免每次 sample_top_p 分配 ~1.7MB)
+    std::vector<float> sample_probs_;
+    std::vector<std::pair<float, int>> sample_prob_idx_;
+
+    // 特殊 token ID 缓存 (避免每次 generate 时线性扫描 150K 词表)
+    int32_t cached_im_start_ = -1;
+    int32_t cached_im_end_ = -1;
+    int32_t cached_nl_token_ = -1;
 };
 
 } // namespace localllm

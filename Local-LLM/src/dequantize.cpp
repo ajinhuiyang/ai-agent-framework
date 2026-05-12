@@ -730,27 +730,29 @@ float vec_dot_q8_0(const void* src, const float* y, int64_t n) {
     float sumf = 0.0f;
 
 #ifdef USE_NEON
+    // 优化: 每个 block 内先用 float FMA 累加, 延迟乘 scale d 到 block 结束
+    // 避免每 8 元素做一次 vmulq_n_f32(vq_f32, d)
     float32x4_t acc_total = vdupq_n_f32(0.0f);
     for (int i = 0; i < nb; i++) {
         const float d = f16_to_f32(x[i].d);
         const int8_t* qs = x[i].qs;
         const float* yb = y + i * 32;
 
-        // Process 32 elements in chunks of 8 using NEON
+        // 累加 q[j] * y[j] (不含 d), 最后统一乘 d
+        float32x4_t block_acc = vdupq_n_f32(0.0f);
         for (int j = 0; j < 32; j += 8) {
-            // Load 8 int8 values, widen to int16, then int32
             int8x8_t vq = vld1_s8(qs + j);
             int16x8_t vq16 = vmovl_s8(vq);
 
-            // Load 8 float values and convert to int (approximate for dot product)
-            // Better: accumulate float directly
             float32x4_t vy0 = vld1q_f32(yb + j);
             float32x4_t vy1 = vld1q_f32(yb + j + 4);
             float32x4_t vq_f32_0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vq16)));
             float32x4_t vq_f32_1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vq16)));
-            acc_total = vfmaq_f32(acc_total, vmulq_n_f32(vq_f32_0, d), vy0);
-            acc_total = vfmaq_f32(acc_total, vmulq_n_f32(vq_f32_1, d), vy1);
+            block_acc = vfmaq_f32(block_acc, vq_f32_0, vy0);
+            block_acc = vfmaq_f32(block_acc, vq_f32_1, vy1);
         }
+        // 一个 block 结束, 将 block_acc * d 累加到总和
+        acc_total = vfmaq_n_f32(acc_total, block_acc, d);
     }
     sumf = vaddvq_f32(acc_total);
 #else
@@ -771,6 +773,66 @@ float vec_dot_q4_0(const void* src, const float* y, int64_t n) {
     const int nb = n / 32;
     float sumf = 0.0f;
 
+#ifdef USE_NEON
+    // 优化: 使用 NEON 整数指令批量解包 16 字节的 nibble
+    // 一次性加载 16 bytes → 分出低 4bit 和高 4bit → 转 float → FMA
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    const uint8x16_t mask_0f = vdupq_n_u8(0x0F);
+
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d);
+        const float* yb = y + i * 32;
+
+        // 加载全部 16 字节量化数据
+        uint8x16_t raw = vld1q_u8(x[i].qs);
+        // 低 4-bit: qs[j] & 0xF (对应 element 0..15)
+        uint8x16_t lo_u8 = vandq_u8(raw, mask_0f);
+        // 高 4-bit: qs[j] >> 4 (对应 element 16..31)
+        uint8x16_t hi_u8 = vshrq_n_u8(raw, 4);
+
+        // 将 uint8 转为 int16 然后减去 8, 再转 float
+        // 处理低 nibble (元素 0-15)
+        float32x4_t block_acc = vdupq_n_f32(0.0f);
+        {
+            int16x8_t lo_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(lo_u8)));
+            int16x8_t lo_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(lo_u8)));
+            int16x8_t v8_s16 = vdupq_n_s16(8);
+            lo_lo = vsubq_s16(lo_lo, v8_s16);
+            lo_hi = vsubq_s16(lo_hi, v8_s16);
+
+            float32x4_t vq0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_lo)));
+            float32x4_t vq1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo_lo)));
+            float32x4_t vq2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo_hi)));
+            float32x4_t vq3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo_hi)));
+
+            block_acc = vfmaq_f32(block_acc, vq0, vld1q_f32(yb + 0));
+            block_acc = vfmaq_f32(block_acc, vq1, vld1q_f32(yb + 4));
+            block_acc = vfmaq_f32(block_acc, vq2, vld1q_f32(yb + 8));
+            block_acc = vfmaq_f32(block_acc, vq3, vld1q_f32(yb + 12));
+        }
+        // 处理高 nibble (元素 16-31)
+        {
+            int16x8_t hi_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(hi_u8)));
+            int16x8_t hi_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(hi_u8)));
+            int16x8_t v8_s16 = vdupq_n_s16(8);
+            hi_lo = vsubq_s16(hi_lo, v8_s16);
+            hi_hi = vsubq_s16(hi_hi, v8_s16);
+
+            float32x4_t vq0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_lo)));
+            float32x4_t vq1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi_lo)));
+            float32x4_t vq2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi_hi)));
+            float32x4_t vq3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi_hi)));
+
+            block_acc = vfmaq_f32(block_acc, vq0, vld1q_f32(yb + 16));
+            block_acc = vfmaq_f32(block_acc, vq1, vld1q_f32(yb + 20));
+            block_acc = vfmaq_f32(block_acc, vq2, vld1q_f32(yb + 24));
+            block_acc = vfmaq_f32(block_acc, vq3, vld1q_f32(yb + 28));
+        }
+        // block 内结果统一乘 d
+        acc = vfmaq_n_f32(acc, block_acc, d);
+    }
+    sumf = vaddvq_f32(acc);
+#else
     for (int i = 0; i < nb; i++) {
         const float d = f16_to_f32(x[i].d);
         const float* yb = y + i * 32;
@@ -783,6 +845,7 @@ float vec_dot_q4_0(const void* src, const float* y, int64_t n) {
         }
         sumf += d * s;
     }
+#endif
     return sumf;
 }
 

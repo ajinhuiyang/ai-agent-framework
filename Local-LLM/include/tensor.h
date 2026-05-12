@@ -40,7 +40,6 @@ public:
     int num_threads() const { return n_threads_; }
 
     // 并行执行: 将 [0, total) 分给多个线程
-    // 使用过分拆分 (over-decomposition) 实现自动负载均衡
     void parallel_for(int64_t total, const std::function<void(int64_t, int64_t)>& fn) {
         if (total <= 0) return;
         if (n_threads_ <= 1 || total < 32) {
@@ -48,27 +47,27 @@ public:
             return;
         }
 
-        // 拆成比线程数更多的 chunk, 实现负载均衡
-        // 慢线程 (E核) 做少点, 快线程 (P核) 多抢
-        int n_chunks = n_threads_ * 4;
-        if (n_chunks > (int)total) n_chunks = (int)total;
-        int64_t chunk = (total + n_chunks - 1) / n_chunks;
+        // 工作窃取式: 每个线程用原子计数器抢 chunk
+        int64_t chunk_size = std::max<int64_t>(1, (total + n_threads_ * 4 - 1) / (n_threads_ * 4));
+        current_fn_ = &fn;
+        chunk_total_ = total;
+        chunk_size_ = chunk_size;
+        chunk_next_.store(0, std::memory_order_relaxed);
+        chunks_done_.store(0, std::memory_order_relaxed);
+        int64_t n_chunks = (total + chunk_size - 1) / chunk_size;
+        chunks_total_ = static_cast<int>(n_chunks);
 
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            tasks_remaining_ = 0;
-            for (int t = 0; t < n_chunks; ++t) {
-                int64_t start = t * chunk;
-                int64_t end = std::min(start + chunk, total);
-                if (start >= total) break;
-                task_queue_.push_back({fn, start, end});
-                tasks_remaining_++;
-            }
-        }
+        // 唤醒工作线程
+        generation_.fetch_add(1, std::memory_order_release);
         cv_work_.notify_all();
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_done_.wait(lock, [this] { return tasks_remaining_ == 0; });
+        // 主线程也参与计算
+        work_steal_loop();
+
+        // 等待所有 chunk 完成
+        while (chunks_done_.load(std::memory_order_acquire) < chunks_total_) {
+            std::this_thread::yield();
+        }
     }
 
 private:
@@ -76,7 +75,6 @@ private:
         n_threads_ = static_cast<int>(std::thread::hardware_concurrency());
         if (n_threads_ <= 0) n_threads_ = 4;
 
-        // 获取性能核数
         n_perf_cores_ = n_threads_;
 #if defined(__APPLE__)
         int perf_cores = 0;
@@ -86,53 +84,72 @@ private:
         }
 #endif
 
-        for (int i = 0; i < n_threads_; ++i) {
+        // 工作线程比 CPU 核少 1 个 (主线程也参与计算)
+        int n_workers = n_threads_ - 1;
+        for (int i = 0; i < n_workers; ++i) {
             workers_.emplace_back([this] { worker_loop(); });
         }
     }
 
     ~ThreadPool() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stop_ = true;
-        }
+        stop_.store(true, std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
         cv_work_.notify_all();
         for (auto& w : workers_) w.join();
     }
 
-    struct Task {
-        std::function<void(int64_t, int64_t)> fn;
-        int64_t start, end;
-    };
+    void work_steal_loop() {
+        while (true) {
+            int64_t idx = chunk_next_.fetch_add(1, std::memory_order_relaxed);
+            int64_t start = idx * chunk_size_;
+            if (start >= chunk_total_) break;
+            int64_t end = std::min(start + chunk_size_, chunk_total_);
+            (*current_fn_)(start, end);
+            chunks_done_.fetch_add(1, std::memory_order_release);
+        }
+    }
 
     void worker_loop() {
+        int last_gen = 0;
         while (true) {
-            Task task;
-            {
+            // 自旋等待 + 短暂 yield，避免 mutex 开销
+            int gen;
+            while ((gen = generation_.load(std::memory_order_acquire)) == last_gen) {
+                if (stop_.load(std::memory_order_relaxed)) return;
+                // 少量自旋后 yield
+                for (int s = 0; s < 64; s++) {
+                    if (generation_.load(std::memory_order_relaxed) != last_gen) goto got_work;
+                }
                 std::unique_lock<std::mutex> lock(mutex_);
-                cv_work_.wait(lock, [this] { return stop_ || !task_queue_.empty(); });
-                if (stop_ && task_queue_.empty()) return;
-                task = task_queue_.back();
-                task_queue_.pop_back();
+                cv_work_.wait_for(lock, std::chrono::microseconds(100), [&] {
+                    return generation_.load(std::memory_order_relaxed) != last_gen || stop_.load(std::memory_order_relaxed);
+                });
+                if (stop_.load(std::memory_order_relaxed)) return;
             }
-            task.fn(task.start, task.end);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                tasks_remaining_--;
-            }
-            cv_done_.notify_one();
+            got_work:
+            last_gen = generation_.load(std::memory_order_relaxed);
+            if (stop_.load(std::memory_order_relaxed)) return;
+
+            work_steal_loop();
         }
     }
 
     int n_threads_;
     int n_perf_cores_ = 4;
     std::vector<std::thread> workers_;
-    std::vector<Task> task_queue_;
+
+    // 工作窃取式并行
+    const std::function<void(int64_t, int64_t)>* current_fn_ = nullptr;
+    int64_t chunk_total_ = 0;
+    int64_t chunk_size_ = 0;
+    std::atomic<int64_t> chunk_next_{0};
+    std::atomic<int> chunks_done_{0};
+    int chunks_total_ = 0;
+    std::atomic<int> generation_{0};
+
     std::mutex mutex_;
     std::condition_variable cv_work_;
-    std::condition_variable cv_done_;
-    int tasks_remaining_ = 0;
-    bool stop_ = false;
+    std::atomic<bool> stop_{false};
 };
 
 // ======================== Tensor ========================
@@ -463,9 +480,32 @@ inline void layernorm(float* y, const float* x, const float* weight, const float
 }
 
 inline void silu(float* y, const float* x, int64_t n) {
+#if defined(__ARM_NEON)
+    // NEON 向量化 SiLU: x / (1 + exp(-x))
+    int64_t i = 0;
+    for (; i + 3 < n; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        float32x4_t neg_x = vnegq_f32(vx);
+        // 标量 exp (NEON 没有硬件 exp, 但 -ffast-math + 编译器可内联)
+        float e0 = expf(vgetq_lane_f32(neg_x, 0));
+        float e1 = expf(vgetq_lane_f32(neg_x, 1));
+        float e2 = expf(vgetq_lane_f32(neg_x, 2));
+        float e3 = expf(vgetq_lane_f32(neg_x, 3));
+        float32x4_t vexp = {e0, e1, e2, e3};
+        float32x4_t one = vdupq_n_f32(1.0f);
+        float32x4_t sigmoid = vrecpeq_f32(vaddq_f32(one, vexp)); // 快速倒数近似
+        sigmoid = vmulq_f32(sigmoid, vrecpsq_f32(sigmoid, vaddq_f32(one, vexp))); // Newton-Raphson 精度校正
+        float32x4_t result = vmulq_f32(vx, sigmoid);
+        vst1q_f32(y + i, result);
+    }
+    for (; i < n; ++i) {
+        y[i] = x[i] / (1.0f + expf(-x[i]));
+    }
+#else
     for (int64_t i = 0; i < n; ++i) {
         y[i] = x[i] / (1.0f + expf(-x[i]));
     }
+#endif
 }
 
 inline void gelu(float* y, const float* x, int64_t n) {
@@ -475,14 +515,27 @@ inline void gelu(float* y, const float* x, int64_t n) {
 }
 
 inline void softmax(float* x, int64_t n) {
+#ifdef USE_ACCELERATE
+    // vDSP 加速 max 和 sum
+    float max_val;
+    vDSP_maxv(x, 1, &max_val, (vDSP_Length)n);
+    float neg_max = -max_val;
+    vDSP_vsadd(x, 1, &neg_max, x, 1, (vDSP_Length)n);  // x[i] -= max_val
+    // 向量化 exp: vvexpf 一次计算整个数组
+    {
+        int nn = static_cast<int>(n);
+        vvexpf(x, x, &nn);
+    }
+    float sum;
+    vDSP_sve(x, 1, &sum, (vDSP_Length)n);
+    float inv_sum = 1.0f / sum;
+    vDSP_vsmul(x, 1, &inv_sum, x, 1, (vDSP_Length)n);
+#else
     float max_val = x[0];
     for (int64_t i = 1; i < n; ++i) if (x[i] > max_val) max_val = x[i];
     float sum = 0.0f;
     for (int64_t i = 0; i < n; ++i) { x[i] = expf(x[i] - max_val); sum += x[i]; }
     float inv_sum = 1.0f / sum;
-#ifdef USE_ACCELERATE
-    vDSP_vsmul(x, 1, &inv_sum, x, 1, (vDSP_Length)n);
-#else
     for (int64_t i = 0; i < n; ++i) x[i] *= inv_sum;
 #endif
 }

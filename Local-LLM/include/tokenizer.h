@@ -43,6 +43,12 @@ public:
     // token 文本
     const std::string& get_token_text(int32_t id) const { return id_to_token_[id]; }
 
+    // 按文本查找 token ID，不存在返回 -1
+    int32_t find_token(const std::string& text) const {
+        auto it = token_to_id_.find(text);
+        return (it != token_to_id_.end()) ? it->second : -1;
+    }
+
 private:
     // BPE 合并
     struct BPEMerge {

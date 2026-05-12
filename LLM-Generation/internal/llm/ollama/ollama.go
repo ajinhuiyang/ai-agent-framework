@@ -26,7 +26,9 @@ func New(baseURL, model string) *Provider {
 	return &Provider{
 		baseURL: baseURL,
 		model:   model,
-		client:  &http.Client{},
+		// 不设置 http.Client.Timeout: 流式请求的超时由调用方的 context 控制。
+		// 设置 Timeout 会导致推理时间较长时 SSE 流被中断。
+		client: &http.Client{},
 	}
 }
 

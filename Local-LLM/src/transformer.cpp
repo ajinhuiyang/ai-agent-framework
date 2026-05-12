@@ -9,6 +9,7 @@
 #include <numeric>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace localllm {
 
@@ -203,10 +204,35 @@ bool Transformer::load_model(const std::string& model_path) {
 
     // 7. 预计算 RoPE 频率表 (消除 forward 中的 powf 重复计算)
     int head_dim = config_.head_dim;
-    rope_freq_.resize(head_dim / 2);
-    for (int i = 0; i < head_dim / 2; ++i) {
+    int half_dim = head_dim / 2;
+    rope_freq_.resize(half_dim);
+    for (int i = 0; i < half_dim; ++i) {
         rope_freq_[i] = 1.0f / powf(config_.rope_theta, (float)(2 * i) / head_dim);
     }
+
+    // 8. 预计算 RoPE cos/sin 查找表 (消除 forward 中的 cosf/sinf 调用)
+    int ctx_len = config_.context_len;
+    rope_cos_.resize(ctx_len * half_dim);
+    rope_sin_.resize(ctx_len * half_dim);
+    for (int pos = 0; pos < ctx_len; ++pos) {
+        for (int i = 0; i < half_dim; ++i) {
+            float val = pos * rope_freq_[i];
+            rope_cos_[pos * half_dim + i] = cosf(val);
+            rope_sin_[pos * half_dim + i] = sinf(val);
+        }
+    }
+
+    // 9. 缓存特殊 token ID (避免每次 generate 时线性扫描 150K 词表)
+    for (int32_t i = 0; i < tokenizer_.vocab_size(); ++i) {
+        const std::string& text = tokenizer_.get_token_text(i);
+        if (text == "<|im_start|>") cached_im_start_ = i;
+        else if (text == "<|im_end|>") cached_im_end_ = i;
+        else if (text == "\n" || text == "Ċ") {
+            if (cached_nl_token_ < 0) cached_nl_token_ = i;
+        }
+    }
+    std::cout << "[Model] Special tokens cached: im_start=" << cached_im_start_
+              << " im_end=" << cached_im_end_ << " nl=" << cached_nl_token_ << std::endl;
 
     auto end = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -224,10 +250,36 @@ void Transformer::forward_attention(int layer, float* x, float* x_out, int32_t p
     int kv_dim = n_kv_heads * head_dim;
     int kv_mul = n_heads / n_kv_heads;
 
-    // Q, K, V 投影
-    mat_vec_mul_tensor(lw.wq, x, q_buf_.data(), n_heads * head_dim, dim);
-    mat_vec_mul_tensor(lw.wk, x, k_buf_.data(), kv_dim, dim);
-    mat_vec_mul_tensor(lw.wv, x, v_buf_.data(), kv_dim, dim);
+    // Q, K, V 投影 — 融合为单次 parallel_for 减少线程同步开销
+    int64_t q_rows = n_heads * head_dim;
+    int64_t total_rows = q_rows + kv_dim + kv_dim;  // wq + wk + wv
+
+    GGMLType wq_type = lw.wq.type();
+    GGMLType wk_type = lw.wk.type();
+    GGMLType wv_type = lw.wv.type();
+    float* q_out = q_buf_.data();
+    float* k_out = k_buf_.data();
+    float* v_out = v_buf_.data();
+
+    if (lw.wq.is_quantized() && lw.wk.is_quantized() && lw.wv.is_quantized()) {
+        ThreadPool::instance().parallel_for(total_rows, [&](int64_t start, int64_t end) {
+            for (int64_t i = start; i < end; ++i) {
+                if (i < q_rows) {
+                    q_out[i] = vec_dot_quant(lw.wq.quant_row_data(i), x, dim, wq_type);
+                } else if (i < q_rows + kv_dim) {
+                    int64_t row = i - q_rows;
+                    k_out[row] = vec_dot_quant(lw.wk.quant_row_data(row), x, dim, wk_type);
+                } else {
+                    int64_t row = i - q_rows - kv_dim;
+                    v_out[row] = vec_dot_quant(lw.wv.quant_row_data(row), x, dim, wv_type);
+                }
+            }
+        });
+    } else {
+        mat_vec_mul_tensor(lw.wq, x, q_out, q_rows, dim);
+        mat_vec_mul_tensor(lw.wk, x, k_out, kv_dim, dim);
+        mat_vec_mul_tensor(lw.wv, x, v_out, kv_dim, dim);
+    }
 
     // 加 bias (Qwen2)
     if (config_.has_attn_bias) {
@@ -236,13 +288,16 @@ void Transformer::forward_attention(int layer, float* x, float* x_out, int32_t p
         if (!lw.bv.empty()) vec_add_inplace(v_buf_.data(), lw.bv.data(), kv_dim);
     }
 
-    // RoPE: 先对所有 KV heads 旋转, 再对 Q heads 旋转
+    // RoPE: 使用预计算 cos/sin 查找表 (消除 cosf/sinf 调用)
+    int half_dim = head_dim / 2;
+    const float* cos_table = rope_cos_.data() + pos * half_dim;
+    const float* sin_table = rope_sin_.data() + pos * half_dim;
+
     for (int h = 0; h < n_kv_heads; ++h) {
         float* k_head = k_buf_.data() + h * head_dim;
         for (int i = 0; i < head_dim; i += 2) {
-            float val = pos * rope_freq_[i / 2];
-            float cos_val = cosf(val);
-            float sin_val = sinf(val);
+            float cos_val = cos_table[i / 2];
+            float sin_val = sin_table[i / 2];
             float k0 = k_head[i], k1 = k_head[i + 1];
             k_head[i]     = k0 * cos_val - k1 * sin_val;
             k_head[i + 1] = k0 * sin_val + k1 * cos_val;
@@ -251,9 +306,8 @@ void Transformer::forward_attention(int layer, float* x, float* x_out, int32_t p
     for (int h = 0; h < n_heads; ++h) {
         float* q_head = q_buf_.data() + h * head_dim;
         for (int i = 0; i < head_dim; i += 2) {
-            float val = pos * rope_freq_[i / 2];
-            float cos_val = cosf(val);
-            float sin_val = sinf(val);
+            float cos_val = cos_table[i / 2];
+            float sin_val = sin_table[i / 2];
             float q0 = q_head[i], q1 = q_head[i + 1];
             q_head[i]     = q0 * cos_val - q1 * sin_val;
             q_head[i + 1] = q0 * sin_val + q1 * cos_val;
@@ -264,42 +318,82 @@ void Transformer::forward_attention(int layer, float* x, float* x_out, int32_t p
     memcpy(kv_cache_.key_cache[layer].row_data(pos), k_buf_.data(), kv_dim * sizeof(float));
     memcpy(kv_cache_.value_cache[layer].row_data(pos), v_buf_.data(), kv_dim * sizeof(float));
 
-    // Attention
+    // Attention: 多头并行化 — 每个 head 的计算相互独立
     float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    int ctx_len = config_.context_len;
 
-    for (int h = 0; h < n_heads; ++h) {
-        float* q_head = q_buf_.data() + h * head_dim;
-        float* attn_scores = attn_buf_.data() + h * config_.context_len;
-        int kv_h = h / kv_mul;
+    // 当 pos 较大 (长序列) 或 heads 较多时并行化收益明显
+    // 当 pos 很小时, Q/K/V 投影才是瓶颈, attention 本身很快, 不值得并行
+    if (n_heads >= 4 && pos >= 16) {
+        ThreadPool::instance().parallel_for(n_heads, [&](int64_t h_start, int64_t h_end) {
+            for (int64_t h = h_start; h < h_end; ++h) {
+                float* q_head = q_buf_.data() + h * head_dim;
+                float* attn_scores = attn_buf_.data() + h * ctx_len;
+                int kv_h = static_cast<int>(h) / kv_mul;
 
-        // Q @ K^T
-        for (int t = 0; t <= pos; ++t) {
-            const float* k_t = kv_cache_.key_cache[layer].row_data(t) + kv_h * head_dim;
+                // Q @ K^T
+                for (int t = 0; t <= pos; ++t) {
+                    const float* k_t = kv_cache_.key_cache[layer].row_data(t) + kv_h * head_dim;
 #ifdef USE_ACCELERATE
-            float dot;
-            vDSP_dotpr(q_head, 1, k_t, 1, &dot, (vDSP_Length)head_dim);
-            attn_scores[t] = dot * scale;
+                    float dot;
+                    vDSP_dotpr(q_head, 1, k_t, 1, &dot, (vDSP_Length)head_dim);
+                    attn_scores[t] = dot * scale;
 #else
-            float score = 0.0f;
-            for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_t[d];
-            attn_scores[t] = score * scale;
+                    float score = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_t[d];
+                    attn_scores[t] = score * scale;
 #endif
-        }
+                }
 
-        softmax(attn_scores, pos + 1);
+                softmax(attn_scores, pos + 1);
 
-        // Weighted sum of values
-        float* out_head = x_out + h * head_dim;
-        memset(out_head, 0, head_dim * sizeof(float));
-        for (int t = 0; t <= pos; ++t) {
-            const float* v_t = kv_cache_.value_cache[layer].row_data(t) + kv_h * head_dim;
-            float w = attn_scores[t];
+                // Weighted sum of values
+                float* out_head = x_out + static_cast<int>(h) * head_dim;
+                memset(out_head, 0, head_dim * sizeof(float));
+                for (int t = 0; t <= pos; ++t) {
+                    const float* v_t = kv_cache_.value_cache[layer].row_data(t) + kv_h * head_dim;
+                    float w = attn_scores[t];
 #ifdef USE_ACCELERATE
-            // out_head += w * v_t
-            vDSP_vsma(v_t, 1, &w, out_head, 1, out_head, 1, (vDSP_Length)head_dim);
+                    vDSP_vsma(v_t, 1, &w, out_head, 1, out_head, 1, (vDSP_Length)head_dim);
 #else
-            for (int d = 0; d < head_dim; ++d) out_head[d] += w * v_t[d];
+                    for (int d = 0; d < head_dim; ++d) out_head[d] += w * v_t[d];
 #endif
+                }
+            }
+        });
+    } else {
+        // 短序列/少头数: 串行执行避免线程调度开销
+        for (int h = 0; h < n_heads; ++h) {
+            float* q_head = q_buf_.data() + h * head_dim;
+            float* attn_scores = attn_buf_.data() + h * ctx_len;
+            int kv_h = h / kv_mul;
+
+            for (int t = 0; t <= pos; ++t) {
+                const float* k_t = kv_cache_.key_cache[layer].row_data(t) + kv_h * head_dim;
+#ifdef USE_ACCELERATE
+                float dot;
+                vDSP_dotpr(q_head, 1, k_t, 1, &dot, (vDSP_Length)head_dim);
+                attn_scores[t] = dot * scale;
+#else
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_t[d];
+                attn_scores[t] = score * scale;
+#endif
+            }
+
+            softmax(attn_scores, pos + 1);
+
+            float* out_head = x_out + h * head_dim;
+            memset(out_head, 0, head_dim * sizeof(float));
+            for (int t = 0; t <= pos; ++t) {
+                const float* v_t = kv_cache_.value_cache[layer].row_data(t) + kv_h * head_dim;
+                float w = attn_scores[t];
+#ifdef USE_ACCELERATE
+                vDSP_vsma(v_t, 1, &w, out_head, 1, out_head, 1, (vDSP_Length)head_dim);
+#else
+                for (int d = 0; d < head_dim; ++d) out_head[d] += w * v_t[d];
+#endif
+            }
         }
     }
 }
@@ -309,29 +403,21 @@ void Transformer::forward_ffn(int layer, float* x, float* x_out) {
     int dim = config_.hidden_size;
     int hidden_dim = config_.intermediate_size;
 
-    // SwiGLU FFN: W1/W3 合并并行, 共享 x 输入
+    // SwiGLU FFN: W1/W3 合并并行 + SiLU 融合
     float* buf1 = ffn_buf1_.data();
-    float* buf2 = ffn_buf2_.data();
 
-    // 用线程池同时计算 W1 和 W3 的各一半行
-    ThreadPool::instance().parallel_for(hidden_dim * 2, [&](int64_t start, int64_t end) {
-        for (int64_t idx = start; idx < end; ++idx) {
-            if (idx < hidden_dim) {
-                // W1 的第 idx 行
-                int64_t row = idx;
-                buf1[row] = vec_dot_quant(lw.w1.quant_row_data(row), x, dim, lw.w1.type());
-            } else {
-                // W3 的第 (idx - hidden_dim) 行
-                int64_t row = idx - hidden_dim;
-                buf2[row] = vec_dot_quant(lw.w3.quant_row_data(row), x, dim, lw.w3.type());
-            }
+    GGMLType w1type = lw.w1.type();
+    GGMLType w3type = lw.w3.type();
+
+    // W1, W3 并行计算 + SiLU 融合: 减少一次 parallel_for 同步
+    ThreadPool::instance().parallel_for(hidden_dim, [&](int64_t start, int64_t end) {
+        for (int64_t row = start; row < end; ++row) {
+            float gate = vec_dot_quant(lw.w1.quant_row_data(row), x, dim, w1type);
+            float up   = vec_dot_quant(lw.w3.quant_row_data(row), x, dim, w3type);
+            // 融合 SiLU: gate / (1 + exp(-gate)) * up
+            buf1[row] = (gate / (1.0f + expf(-gate))) * up;
         }
     });
-
-    // SiLU(gate) * up
-    for (int i = 0; i < hidden_dim; ++i) {
-        buf1[i] = (buf1[i] / (1.0f + expf(-buf1[i]))) * buf2[i];
-    }
 
     // W2 @ (gate * up) -> x_out
     mat_vec_mul_tensor(lw.w2, buf1, x_out, dim, hidden_dim);
@@ -341,14 +427,46 @@ void Transformer::forward_layer(int layer, float* x, int32_t pos) {
     auto& lw = weights_.layers[layer];
     int dim = config_.hidden_size;
 
+    // 层内计时 (仅第一层第一次 decode 输出, 定位瓶颈)
+    static bool profiled = false;
+    bool do_profile = (!profiled && layer == 0 && pos > 0);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+
     rmsnorm(x_buf_.data(), x, lw.attn_norm.data(), dim, config_.rms_norm_eps);
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+
     forward_attention(layer, x_buf_.data(), x_buf2_.data(), pos);
+
+    auto t2 = std::chrono::high_resolution_clock::now();
+
     mat_vec_mul_tensor(weights_.layers[layer].wo, x_buf2_.data(), attn_out_.data(), dim, dim);
+
+    auto t3 = std::chrono::high_resolution_clock::now();
+
     vec_add_inplace(x, attn_out_.data(), dim);
 
     rmsnorm(x_buf_.data(), x, lw.ffn_norm.data(), dim, config_.rms_norm_eps);
+
+    auto t4 = std::chrono::high_resolution_clock::now();
+
     forward_ffn(layer, x_buf_.data(), x_buf2_.data());
+
+    auto t5 = std::chrono::high_resolution_clock::now();
+
     vec_add_inplace(x, x_buf2_.data(), dim);
+
+    if (do_profile) {
+        profiled = true;
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::cout << "[Profile] Layer 0 breakdown (pos=" << pos << "):"
+                  << " norm=" << ms(t0,t1) << "ms"
+                  << " attn=" << ms(t1,t2) << "ms"
+                  << " wo=" << ms(t2,t3) << "ms"
+                  << " ffn=" << ms(t4,t5) << "ms"
+                  << " total=" << ms(t0,t5) << "ms" << std::endl;
+    }
 }
 
 const std::vector<float>& Transformer::forward(int32_t token, int32_t pos) {
@@ -357,13 +475,27 @@ const std::vector<float>& Transformer::forward(int32_t token, int32_t pos) {
     if (x_embed_.size() != (size_t)dim) x_embed_.resize(dim);
     memcpy(x_embed_.data(), weights_.token_embedding.row_data(token), dim * sizeof(float));
 
+    auto layers_start = std::chrono::high_resolution_clock::now();
     for (int l = 0; l < config_.num_layers; ++l) {
         forward_layer(l, x_embed_.data(), pos);
     }
+    auto layers_end = std::chrono::high_resolution_clock::now();
 
     rmsnorm(x_embed_.data(), x_embed_.data(), weights_.output_norm.data(), dim, config_.rms_norm_eps);
     logits_.resize(config_.vocab_size);
+
+    auto proj_start = std::chrono::high_resolution_clock::now();
     mat_vec_mul_tensor(weights_.output, x_embed_.data(), logits_.data(), config_.vocab_size, dim);
+    auto proj_end = std::chrono::high_resolution_clock::now();
+
+    // 仅第一次 decode 输出
+    static bool profiled_fwd = false;
+    if (!profiled_fwd && pos > 0) {
+        profiled_fwd = true;
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        std::cout << "[Profile] forward(pos=" << pos << "): layers=" << ms(layers_start, layers_end)
+                  << "ms output_proj=" << ms(proj_start, proj_end) << "ms" << std::endl;
+    }
 
     return logits_;
 }
@@ -413,12 +545,16 @@ void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
             if (!lw.bv.empty()) vec_add_inplace(v, lw.bv.data(), kv_dim);
         }
 
-        // RoPE (使用预计算频率表)
+        // RoPE (使用预计算 cos/sin 查找表)
+        int half_dim = head_dim / 2;
+        const float* cos_table = rope_cos_.data() + pos * half_dim;
+        const float* sin_table = rope_sin_.data() + pos * half_dim;
+
         for (int h = 0; h < n_kv_heads; ++h) {
             float* k_head = k + h * head_dim;
             for (int i = 0; i < head_dim; i += 2) {
-                float val = pos * rope_freq_[i / 2];
-                float cos_val = cosf(val), sin_val = sinf(val);
+                float cos_val = cos_table[i / 2];
+                float sin_val = sin_table[i / 2];
                 float k0 = k_head[i], k1 = k_head[i + 1];
                 k_head[i]     = k0 * cos_val - k1 * sin_val;
                 k_head[i + 1] = k0 * sin_val + k1 * cos_val;
@@ -427,8 +563,8 @@ void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
         for (int h = 0; h < n_heads; ++h) {
             float* q_head = q + h * head_dim;
             for (int i = 0; i < head_dim; i += 2) {
-                float val = pos * rope_freq_[i / 2];
-                float cos_val = cosf(val), sin_val = sinf(val);
+                float cos_val = cos_table[i / 2];
+                float sin_val = sin_table[i / 2];
                 float q0 = q_head[i], q1 = q_head[i + 1];
                 q_head[i]     = q0 * cos_val - q1 * sin_val;
                 q_head[i + 1] = q0 * sin_val + q1 * cos_val;
@@ -439,37 +575,80 @@ void Transformer::forward_attention_batch(int layer, float* X, float* X_out,
         memcpy(kv_cache_.key_cache[layer].row_data(pos), k, kv_dim * sizeof(float));
         memcpy(kv_cache_.value_cache[layer].row_data(pos), v, kv_dim * sizeof(float));
 
-        // Attention: Q @ K^T -> softmax -> @ V
+        // Attention: Q @ K^T -> softmax -> @ V (多头并行化)
         float* x_out = X_out + t * dim;  // 行主序: 第 t 个 token 的 attention 输出
         float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+        int ctx_len = config_.context_len;
 
-        for (int h = 0; h < n_heads; ++h) {
-            float* q_head = q + h * head_dim;
-            int kv_h = h / kv_mul;
+        // 为 batch 中的 attention 分配每个 head 独立的 score buffer
+        // 复用 attn_buf_ 但需要确保 head 间不冲突
+        // attn_buf_ 大小 = n_heads * context_len, 每个 head 使用独立段
+        if (n_heads >= 4 && pos >= 8) {
+            ThreadPool::instance().parallel_for(n_heads, [&](int64_t h_start, int64_t h_end) {
+                for (int64_t h = h_start; h < h_end; ++h) {
+                    float* q_head = q + static_cast<int>(h) * head_dim;
+                    float* scores = attn_buf_.data() + h * ctx_len;
+                    int kv_h = static_cast<int>(h) / kv_mul;
 
-            // Q @ K^T (包含 causal mask: 只看 [0, pos])
-            for (int s = 0; s <= pos; ++s) {
-                const float* k_s = kv_cache_.key_cache[layer].row_data(s) + kv_h * head_dim;
+                    for (int s = 0; s <= pos; ++s) {
+                        const float* k_s = kv_cache_.key_cache[layer].row_data(s) + kv_h * head_dim;
 #ifdef USE_ACCELERATE
-                float score;
-                vDSP_dotpr(q_head, 1, k_s, 1, &score, (vDSP_Length)head_dim);
-                attn_buf_[s] = score * scale;
+                        float score;
+                        vDSP_dotpr(q_head, 1, k_s, 1, &score, (vDSP_Length)head_dim);
+                        scores[s] = score * scale;
 #else
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_s[d];
-                attn_buf_[s] = score * scale;
+                        float score = 0.0f;
+                        for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_s[d];
+                        scores[s] = score * scale;
 #endif
-            }
+                    }
 
-            softmax(attn_buf_.data(), pos + 1);
+                    softmax(scores, pos + 1);
 
-            // Weighted sum of V
-            float* out_head = x_out + h * head_dim;
-            memset(out_head, 0, head_dim * sizeof(float));
-            for (int s = 0; s <= pos; ++s) {
-                const float* v_s = kv_cache_.value_cache[layer].row_data(s) + kv_h * head_dim;
-                float w = attn_buf_[s];
-                for (int d = 0; d < head_dim; ++d) out_head[d] += w * v_s[d];
+                    float* out_head = x_out + static_cast<int>(h) * head_dim;
+                    memset(out_head, 0, head_dim * sizeof(float));
+                    for (int s = 0; s <= pos; ++s) {
+                        const float* v_s = kv_cache_.value_cache[layer].row_data(s) + kv_h * head_dim;
+                        float w = scores[s];
+#ifdef USE_ACCELERATE
+                        vDSP_vsma(v_s, 1, &w, out_head, 1, out_head, 1, (vDSP_Length)head_dim);
+#else
+                        for (int d = 0; d < head_dim; ++d) out_head[d] += w * v_s[d];
+#endif
+                    }
+                }
+            });
+        } else {
+            for (int h = 0; h < n_heads; ++h) {
+                float* q_head = q + h * head_dim;
+                int kv_h = h / kv_mul;
+
+                for (int s = 0; s <= pos; ++s) {
+                    const float* k_s = kv_cache_.key_cache[layer].row_data(s) + kv_h * head_dim;
+#ifdef USE_ACCELERATE
+                    float score;
+                    vDSP_dotpr(q_head, 1, k_s, 1, &score, (vDSP_Length)head_dim);
+                    attn_buf_[s] = score * scale;
+#else
+                    float score = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) score += q_head[d] * k_s[d];
+                    attn_buf_[s] = score * scale;
+#endif
+                }
+
+                softmax(attn_buf_.data(), pos + 1);
+
+                float* out_head = x_out + h * head_dim;
+                memset(out_head, 0, head_dim * sizeof(float));
+                for (int s = 0; s <= pos; ++s) {
+                    const float* v_s = kv_cache_.value_cache[layer].row_data(s) + kv_h * head_dim;
+                    float w = attn_buf_[s];
+#ifdef USE_ACCELERATE
+                    vDSP_vsma(v_s, 1, &w, out_head, 1, out_head, 1, (vDSP_Length)head_dim);
+#else
+                    for (int d = 0; d < head_dim; ++d) out_head[d] += w * v_s[d];
+#endif
+                }
             }
         }
     }
@@ -488,12 +667,14 @@ void Transformer::forward_ffn_batch(int layer, float* X, float* X_out, int64_t s
     mat_mat_mul_tensor(lw.w1, X, batch_ffn1_.data(), hidden_dim, dim, seq_len);
     mat_mat_mul_tensor(lw.w3, X, batch_ffn2_.data(), hidden_dim, dim, seq_len);
 
-    // SiLU(gate) * up
+    // SiLU(gate) * up — 并行化大数组
     int64_t total = hidden_dim * seq_len;
-    for (int64_t i = 0; i < total; ++i) {
-        float g = batch_ffn1_[i];
-        batch_ffn1_[i] = (g / (1.0f + expf(-g))) * batch_ffn2_[i];
-    }
+    ThreadPool::instance().parallel_for(total, [&](int64_t start, int64_t end) {
+        for (int64_t i = start; i < end; ++i) {
+            float g = batch_ffn1_[i];
+            batch_ffn1_[i] = (g / (1.0f + expf(-g))) * batch_ffn2_[i];
+        }
+    });
 
     // W2 @ result -> X_out [dim, seq_len]
     mat_mat_mul_tensor(lw.w2, batch_ffn1_.data(), X_out, dim, hidden_dim, seq_len);
@@ -576,18 +757,72 @@ std::vector<float> Transformer::forward_batch(const std::vector<int32_t>& tokens
 
 // ======================== 采样 ========================
 
-static int32_t sample_top_p(std::vector<float>& logits, float temperature, float top_p,
+int32_t Transformer::sample_top_p(std::vector<float>& logits, float temperature, float top_p,
                             const std::vector<int32_t>& output_tokens, float repetition_penalty) {
     int n = static_cast<int>(logits.size());
 
-    // 重复惩罚: 对已生成的 token 降低 logits
     if (repetition_penalty != 1.0f && !output_tokens.empty()) {
+        // ========== 1. 基础 presence + frequency penalty ==========
+        // 统计每个 token 的出现次数
+        std::unordered_map<int32_t, int> token_counts;
         for (int32_t token : output_tokens) {
+            token_counts[token]++;
+        }
+        for (auto& [token, count] : token_counts) {
             if (token >= 0 && token < n) {
+                // presence penalty: 对出现过的 token 缩放 logit
                 if (logits[token] > 0) {
                     logits[token] /= repetition_penalty;
                 } else {
                     logits[token] *= repetition_penalty;
+                }
+                // frequency penalty: 按出现次数递增惩罚，但使用对数衰减
+                // 避免对频繁出现的结构性 token (如缩进、括号) 惩罚过重
+                if (count > 1) {
+                    float freq_pen = 0.2f * std::log2f(static_cast<float>(count));
+                    logits[token] -= freq_pen;
+                }
+            }
+        }
+
+        // ========== 2. N-gram 循环检测 ==========
+        // 检测最近输出中是否存在短循环模式 (如 "8","0","8","0"...)。
+        // 如果检测到，对循环中的下一个 token 施加强惩罚，打破循环。
+        // 检查 pattern 长度 1~4 的循环
+        int seq_len = static_cast<int>(output_tokens.size());
+        for (int pat_len = 1; pat_len <= 4 && pat_len * 3 <= seq_len; ++pat_len) {
+            // 检查最后 pat_len 个 token 是否与前 pat_len 个相同 (至少重复 3 次)
+            int repeats = 0;
+            for (int r = 1; r <= 5 && (r + 1) * pat_len <= seq_len; ++r) {
+                bool match = true;
+                for (int j = 0; j < pat_len; ++j) {
+                    if (output_tokens[seq_len - 1 - j] != 
+                        output_tokens[seq_len - 1 - j - r * pat_len]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    repeats++;
+                } else {
+                    break;
+                }
+            }
+            if (repeats >= 2) {
+                // 发现循环: 惩罚循环模式中下一个可能出现的 token
+                // 循环 pattern 是 output_tokens 最后 pat_len 个 token
+                // 下一个循环 token 是 pattern 的第一个
+                int next_in_loop = output_tokens[seq_len - pat_len];
+                if (next_in_loop >= 0 && next_in_loop < n) {
+                    float penalty = 3.0f * static_cast<float>(repeats);
+                    logits[next_in_loop] -= penalty;
+                }
+                // 对循环中所有 token 也施加惩罚
+                for (int j = 0; j < pat_len; ++j) {
+                    int tok = output_tokens[seq_len - 1 - j];
+                    if (tok >= 0 && tok < n && tok != next_in_loop) {
+                        logits[tok] -= 2.0f * static_cast<float>(repeats);
+                    }
                 }
             }
         }
@@ -599,31 +834,32 @@ static int32_t sample_top_p(std::vector<float>& logits, float temperature, float
             std::max_element(logits.begin(), logits.end()) - logits.begin());
     }
 
-    // 应用 temperature
-    std::vector<float> probs(n);
+    // 应用 temperature — 复用成员 buffer 避免每次分配 ~600KB
+    sample_probs_.resize(n);
     float max_logit = *std::max_element(logits.begin(), logits.end());
     float sum = 0.0f;
     for (int i = 0; i < n; ++i) {
-        probs[i] = expf((logits[i] - max_logit) / temperature);
-        sum += probs[i];
+        sample_probs_[i] = expf((logits[i] - max_logit) / temperature);
+        sum += sample_probs_[i];
     }
+    float inv_sum = 1.0f / sum;
     for (int i = 0; i < n; ++i) {
-        probs[i] /= sum;
+        sample_probs_[i] *= inv_sum;
     }
 
     // Top-p (nucleus) sampling — 使用 partial_sort 避免全词表排序
-    // 大多数情况下 top_p 只覆盖前 100-500 个 token
+    // 复用成员 buffer 避免每次分配 ~1.1MB
     int k = std::min(512, n);
-    std::vector<std::pair<float, int>> prob_idx(n);
+    sample_prob_idx_.resize(n);
     for (int i = 0; i < n; ++i) {
-        prob_idx[i] = {probs[i], i};
+        sample_prob_idx_[i] = {sample_probs_[i], i};
     }
-    std::partial_sort(prob_idx.begin(), prob_idx.begin() + k, prob_idx.end(), std::greater<>());
+    std::partial_sort(sample_prob_idx_.begin(), sample_prob_idx_.begin() + k, sample_prob_idx_.end(), std::greater<>());
 
     float cumulative = 0.0f;
-    int cutoff = k;  // 最多搜索前 k 个
+    int cutoff = k;
     for (int i = 0; i < k; ++i) {
-        cumulative += prob_idx[i].first;
+        cumulative += sample_prob_idx_[i].first;
         if (cumulative >= top_p) {
             cutoff = i + 1;
             break;
@@ -633,7 +869,7 @@ static int32_t sample_top_p(std::vector<float>& logits, float temperature, float
     // 重新归一化
     float renorm_sum = 0.0f;
     for (int i = 0; i < cutoff; ++i) {
-        renorm_sum += prob_idx[i].first;
+        renorm_sum += sample_prob_idx_[i].first;
     }
 
     // 随机采样
@@ -643,13 +879,13 @@ static int32_t sample_top_p(std::vector<float>& logits, float temperature, float
 
     float acc = 0.0f;
     for (int i = 0; i < cutoff; ++i) {
-        acc += prob_idx[i].first;
+        acc += sample_prob_idx_[i].first;
         if (acc >= r) {
-            return prob_idx[i].second;
+            return sample_prob_idx_[i].second;
         }
     }
 
-    return prob_idx[0].second;
+    return sample_prob_idx_[0].second;
 }
 
 Transformer::GenerateResult Transformer::generate(const std::string& prompt,
@@ -662,21 +898,11 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
     // 构建 prompt tokens
     std::vector<int32_t> prompt_tokens;
 
-    // Qwen2 chat template
+    // Qwen2 chat template — 使用缓存的特殊 token ID (模型加载时已扫描)
     if (config_.architecture == "qwen2") {
-        auto find_token = [&](const std::string& text) -> int32_t {
-            for (int32_t i = 0; i < tokenizer_.vocab_size(); ++i) {
-                if (tokenizer_.get_token_text(i) == text) return i;
-            }
-            return -1;
-        };
-
-        int32_t im_start = find_token("<|im_start|>");
-        int32_t im_end = find_token("<|im_end|>");
-        int32_t nl_token = find_token("\n");
-        if (nl_token < 0) {
-            nl_token = find_token("Ċ");
-        }
+        int32_t im_start = cached_im_start_;
+        int32_t im_end = cached_im_end_;
+        int32_t nl_token = cached_nl_token_;
 
         if (im_start >= 0 && im_end >= 0) {
             // system turn — 使用传入的 system_prompt 或默认值
@@ -711,6 +937,38 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
         } else {
             prompt_tokens = tokenizer_.encode(prompt, true);
         }
+    }
+    // Mistral / Codestral chat template: [INST] system\n\nuser [/INST]
+    else if (config_.architecture == "llama" || config_.architecture == "mistral") {
+        // Codestral/Mistral 使用 SentencePiece tokenizer，[INST] 和 [/INST] 可能是特殊 token。
+        int32_t inst_id = tokenizer_.find_token("[INST]");
+        int32_t inst_end_id = tokenizer_.find_token("[/INST]");
+
+        if (inst_id >= 0 && inst_end_id >= 0) {
+            // <s> [INST] {system}\n\n{user} [/INST]
+            prompt_tokens.push_back(tokenizer_.bos_token());
+            prompt_tokens.push_back(inst_id);
+
+            std::string full_prompt;
+            if (!system_prompt.empty()) {
+                full_prompt = system_prompt + "\n\n" + prompt;
+            } else {
+                full_prompt = prompt;
+            }
+
+            auto msg_tokens = tokenizer_.encode(full_prompt, false);
+            prompt_tokens.insert(prompt_tokens.end(), msg_tokens.begin(), msg_tokens.end());
+            prompt_tokens.push_back(inst_end_id);
+        } else {
+            // [INST] 不是独立 token，作为文本嵌入
+            std::string formatted;
+            if (!system_prompt.empty()) {
+                formatted = "[INST] " + system_prompt + "\n\n" + prompt + " [/INST]";
+            } else {
+                formatted = "[INST] " + prompt + " [/INST]";
+            }
+            prompt_tokens = tokenizer_.encode(formatted, true);
+        }
     } else {
         prompt_tokens = tokenizer_.encode(prompt, true);
     }
@@ -719,6 +977,7 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
 
     std::string generated_text;
     std::vector<int32_t> output_tokens;
+    std::string finish_reason = "length";  // 默认为 length, 只有正常结束才改为 stop
 
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -738,9 +997,42 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
     int decode_tokens = 0;
     auto decode_start = std::chrono::high_resolution_clock::now();
 
+    // UTF-8 流式缓冲: GPT-2/Qwen 的 byte-level BPE 可能将一个多字节 UTF-8
+    // 字符拆分到多个 token 中。逐 token 解码时，每个 token 可能只解出部分字节，
+    // 导致中文等多字节字符显示为乱码。我们在这里缓冲不完整的字节序列，
+    // 只把完整的 UTF-8 字符传给 callback。
+    std::string utf8_buffer;
+
+    // 辅助函数: 根据 UTF-8 首字节判断该字符需要多少字节
+    auto utf8_char_len = [](unsigned char c) -> int {
+        if (c < 0x80) return 1;
+        if ((c & 0xE0) == 0xC0) return 2;
+        if ((c & 0xF0) == 0xE0) return 3;
+        if ((c & 0xF8) == 0xF0) return 4;
+        return 1; // 无效字节当 1 字节处理
+    };
+
+    // 辅助函数: 从 buffer 中提取所有完整的 UTF-8 字符，
+    // 返回完整部分的字符串，留下不完整的尾部在 buffer 中
+    auto flush_utf8 = [&utf8_buffer, &utf8_char_len]() -> std::string {
+        std::string complete;
+        size_t i = 0;
+        while (i < utf8_buffer.size()) {
+            int expected = utf8_char_len(static_cast<unsigned char>(utf8_buffer[i]));
+            if (i + expected <= utf8_buffer.size()) {
+                complete += utf8_buffer.substr(i, expected);
+                i += expected;
+            } else {
+                break; // 剩余字节不完整
+            }
+        }
+        utf8_buffer = utf8_buffer.substr(i);
+        return complete;
+    };
+
     // 退化检测: 基于 token n-gram 重复率
     // 记录最近生成的 token，检测是否出现 n-gram 重复
-    auto detect_degeneration = [](const std::vector<int32_t>& tokens, int recent_count = 64) -> bool {
+    auto detect_degeneration = [](const std::vector<int32_t>& tokens, int recent_count = 128) -> bool {
         int total = static_cast<int>(tokens.size());
         if (total < recent_count * 2) return false;
 
@@ -766,9 +1058,10 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
             }
         }
 
-        // 如果超过 30% 的 4-gram 是重复的，判定为退化
+        // 如果超过 50% 的 4-gram 是重复的，判定为退化
+        // (从 30% 提高到 50%，避免正常代码中的缩进/括号模式被误判)
         float repeat_ratio = (ngram_total > 0) ? static_cast<float>(ngram_repeated) / ngram_total : 0;
-        return repeat_ratio > 0.3f;
+        return repeat_ratio > 0.5f;
     };
 
     // 代码生成智能停止: 追踪代码块结构
@@ -781,12 +1074,21 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
         int32_t next_token = sample_top_p(logits_, temperature, top_p, output_tokens, repetition_penalty);
 
         if (tokenizer_.is_eos(next_token)) {
+            finish_reason = "stop";
+            std::cout << "[Generate] Stopped by EOS token (id=" << next_token
+                      << ", text='" << tokenizer_.get_token_text(next_token) 
+                      << "') at token " << decode_tokens << std::endl;
             break;
         }
 
         output_tokens.push_back(next_token);
         std::string token_text = tokenizer_.decode(next_token);
         generated_text += token_text;
+
+        // UTF-8 流式缓冲: 将解码的字节加入缓冲区，提取完整字符
+        utf8_buffer += token_text;
+        std::string complete_text = flush_utf8();
+        // complete_text 是可以安全发送的完整 UTF-8 字符串
 
         // 追踪代码块状态 (只在 token 文本以 ``` 开头或仅为 ``` 时触发)
         {
@@ -819,15 +1121,17 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
         // 如果已有一个完整代码块，检查是否开始重复
         if (code_block_count >= 1 && !in_code_block) {
             post_code_tokens++;
-            if (post_code_tokens > 120) {
+            if (post_code_tokens > 500) {
                 // 代码块结束后过长的解释文字，停止
+                finish_reason = "stop";
                 break;
             }
         }
 
-        // 第二个完整代码块出现 — 大概率是退化重复
-        if (code_block_count >= 2) {
-            std::cout << "[Generate] Second code block completed, stopping to prevent repetition" << std::endl;
+        // 第四个完整代码块出现 — 大概率是退化重复
+        if (code_block_count >= 4) {
+            std::cout << "[Generate] Too many code blocks (" << code_block_count << "), stopping" << std::endl;
+            finish_reason = "stop";
             // 回退到第二个代码块开始的 ``` 之前
             // 从末尾倒着找三次 ``` (第2块的关闭、第2块的开启)
             auto p = generated_text.rfind("```");
@@ -843,9 +1147,10 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
             break;
         }
 
-        // 每 16 个 token 检测 n-gram 退化
-        if (decode_tokens > 32 && decode_tokens % 16 == 0 && detect_degeneration(output_tokens)) {
+        // 每 32 个 token 检测 n-gram 退化 (延后到 256 token 后才开始检测)
+        if (decode_tokens > 256 && decode_tokens % 32 == 0 && detect_degeneration(output_tokens)) {
             std::cout << "[Generate] N-gram repetition detected at token " << decode_tokens << ", stopping early" << std::endl;
+            finish_reason = "stop";
             // 回退到最后一个完整行
             auto last_newline = generated_text.rfind('\n', generated_text.size() > 32 ? generated_text.size() - 32 : 0);
             if (last_newline != std::string::npos && last_newline > generated_text.size() / 3) {
@@ -855,8 +1160,12 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
         }
 
         if (callback) {
-            if (!callback(next_token, token_text)) {
-                break;
+            // 只发送完整的 UTF-8 字符；如果当前 token 只解出了部分字节，
+            // complete_text 为空，跳过此次 callback
+            if (!complete_text.empty()) {
+                if (!callback(next_token, complete_text)) {
+                    break;
+                }
             }
         }
 
@@ -873,11 +1182,14 @@ Transformer::GenerateResult Transformer::generate(const std::string& prompt,
     std::cout << "\n[Generate] Decode: " << decode_tokens << " tokens in "
               << decode_ms << " ms (" << decode_tps << " tok/s)" << std::endl;
     std::cout << "[Generate] Total: " << total_ms << " ms" << std::endl;
+    std::cout << "[Generate] finish_reason: " << finish_reason 
+              << ", max_tokens: " << max_tokens << std::endl;
 
     GenerateResult result;
     result.text = generated_text;
     result.prompt_tokens = static_cast<int>(prompt_tokens.size());
     result.completion_tokens = decode_tokens;
+    result.finish_reason = finish_reason;
     return result;
 }
 

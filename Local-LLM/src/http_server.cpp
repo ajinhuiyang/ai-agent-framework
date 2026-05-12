@@ -2,6 +2,7 @@
 #include "platform.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -19,14 +20,25 @@ void SimpleJSON::skip_whitespace(const std::string& str, size_t& pos) {
 std::string SimpleJSON::escape_string(const std::string& s) {
     std::string result;
     result.reserve(s.size() + 2);
-    for (char c : s) {
+    for (unsigned char c : s) {
         switch (c) {
             case '"':  result += "\\\""; break;
             case '\\': result += "\\\\"; break;
             case '\n': result += "\\n"; break;
             case '\r': result += "\\r"; break;
             case '\t': result += "\\t"; break;
-            default:   result += c; break;
+            case '\b': result += "\\b"; break;
+            case '\f': result += "\\f"; break;
+            default:
+                if (c < 0x20) {
+                    // 转义其他控制字符为 \u00XX
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    result += buf;
+                } else {
+                    result += static_cast<char>(c);
+                }
+                break;
         }
     }
     return result;
@@ -482,20 +494,31 @@ HttpResponse HttpServer::handle_chat_completions(const HttpRequest& req) {
             if (role == "system") {
                 system_msg = content;
             } else if (role == "user") {
-                user_msg += content + "\n";
+                // 多条 user 消息用换行分隔，但最后一条不加尾部换行
+                if (!user_msg.empty()) user_msg += "\n";
+                user_msg += content;
             }
-        }
-        // 将 system prompt 和 user message 合并为一个 prompt
-        // generate() 会自动包装 Qwen chat template
-        std::string prompt = user_msg;
-        if (!system_msg.empty()) {
-            prompt = system_msg + "\n\n" + user_msg;
         }
 
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
         int max_tokens = static_cast<int>(json.get_int("max_tokens", 2048));
-        float repetition_penalty = json.get_float("repetition_penalty", 1.3);
+        float repetition_penalty = json.get_float("repetition_penalty", 1.15);
+        
+        // 兼容 OpenAI 标准字段: frequency_penalty + presence_penalty
+        // 如果客户端传了这两个字段 (go-openai 库默认使用这些)，
+        // 将它们转换为 repetition_penalty
+        float freq_penalty = json.get_float("frequency_penalty", 0.0);
+        float pres_penalty = json.get_float("presence_penalty", 0.0);
+        if ((freq_penalty > 0.0f || pres_penalty > 0.0f) && std::abs(repetition_penalty - 1.15f) < 0.001f) {
+            // 将 OpenAI 风格的 penalty 映射为 repetition_penalty
+            // frequency_penalty 范围 0~2, presence_penalty 范围 -2~2
+            // 映射: repetition_penalty = 1.0 + max(freq, pres) * 0.5
+            float combined = std::max(freq_penalty, pres_penalty);
+            repetition_penalty = 1.0f + combined * 0.5f;
+            if (repetition_penalty < 1.0f) repetition_penalty = 1.0f;
+            if (repetition_penalty > 2.0f) repetition_penalty = 2.0f;
+        }
 
         // 推理 — system 和 user 分开传给 generate()
         std::lock_guard<std::mutex> lock(model_mutex_);
@@ -521,7 +544,7 @@ HttpResponse HttpServer::handle_chat_completions(const HttpRequest& req) {
         message["role"] = SimpleJSON("assistant");
         message["content"] = SimpleJSON(gen_result.text);
         choice["message"] = message;
-        choice["finish_reason"] = SimpleJSON("stop");
+        choice["finish_reason"] = SimpleJSON(gen_result.finish_reason);
 
         SimpleJSON choices = SimpleJSON::array();
         choices.push_back(choice);
@@ -555,18 +578,25 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
             if (role == "system") {
                 system_msg = content;
             } else if (role == "user") {
-                user_msg += content + "\n";
+                if (!user_msg.empty()) user_msg += "\n";
+                user_msg += content;
             }
-        }
-        std::string prompt = user_msg;
-        if (!system_msg.empty()) {
-            prompt = system_msg + "\n\n" + user_msg;
         }
 
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
         int max_tokens = static_cast<int>(json.get_int("max_tokens", 2048));
-        float repetition_penalty = json.get_float("repetition_penalty", 1.3);
+        float repetition_penalty = json.get_float("repetition_penalty", 1.15);
+        
+        // 兼容 OpenAI 标准字段 (与非流式一致)
+        float freq_penalty = json.get_float("frequency_penalty", 0.0);
+        float pres_penalty = json.get_float("presence_penalty", 0.0);
+        if ((freq_penalty > 0.0f || pres_penalty > 0.0f) && std::abs(repetition_penalty - 1.15f) < 0.001f) {
+            float combined = std::max(freq_penalty, pres_penalty);
+            repetition_penalty = 1.0f + combined * 0.5f;
+            if (repetition_penalty < 1.0f) repetition_penalty = 1.0f;
+            if (repetition_penalty > 2.0f) repetition_penalty = 2.0f;
+        }
 
         // 发送 SSE 头
         std::string header = "HTTP/1.1 200 OK\r\n"
@@ -580,38 +610,48 @@ void HttpServer::handle_chat_completions_stream(int client_fd, const HttpRequest
         std::lock_guard<std::mutex> lock(model_mutex_);
         model_.reset();
 
-        auto now = std::chrono::system_clock::now();
-        auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-            now.time_since_epoch()).count();
-
-        model_.generate(user_msg, max_tokens, temperature, top_p,
+        // 与非流式一致: system_msg 作为独立参数传给 generate(),
+        // 由 generate() 内部构建正确的 chat template
+        bool send_failed = false;
+        auto gen_result = model_.generate(user_msg, max_tokens, temperature, top_p,
             [&](int32_t /*token*/, const std::string& text) -> bool {
-                SimpleJSON chunk = SimpleJSON::object();
-                chunk["id"] = SimpleJSON("chatcmpl-localllm");
-                chunk["object"] = SimpleJSON("chat.completion.chunk");
-                chunk["created"] = SimpleJSON(static_cast<int64_t>(epoch));
-                chunk["model"] = SimpleJSON(model_.config().name);
-
-                SimpleJSON delta = SimpleJSON::object();
-                delta["content"] = SimpleJSON(text);
-
-                SimpleJSON choice = SimpleJSON::object();
-                choice["index"] = SimpleJSON(0);
-                choice["delta"] = delta;
-                choice["finish_reason"] = SimpleJSON();
-
-                SimpleJSON choices = SimpleJSON::array();
-                choices.push_back(choice);
-                chunk["choices"] = choices;
-
-                std::string sse = "data: " + chunk.dump() + "\n\n";
+                // 精简 SSE JSON: 只发必要字段, 减少序列化开销
+                std::string sse = "data: {\"choices\":[{\"delta\":{\"content\":\"" 
+                                  + SimpleJSON::escape_string(text) + "\"}}]}\n\n";
                 int sent = platform::socket_send(client_fd, sse.c_str(), static_cast<int>(sse.size()));
-                return sent >= 0;
+                if (sent < 0) {
+                    send_failed = true;
+                    std::cerr << "[HTTP] Stream send failed, stopping generation" << std::endl;
+                    return false;
+                }
+                return true;
             }, system_msg, repetition_penalty);
 
-        // 发送结束标志
-        std::string done = "data: [DONE]\n\n";
-        platform::socket_send(client_fd, done.c_str(), static_cast<int>(done.size()));
+        if (!send_failed) {
+            // 发送包含 finish_reason 和 usage 的最终 chunk (OpenAI 兼容格式)
+            SimpleJSON final_chunk = SimpleJSON::object();
+            SimpleJSON final_choice = SimpleJSON::object();
+            final_choice["index"] = SimpleJSON(0);
+            SimpleJSON delta = SimpleJSON::object();
+            final_choice["delta"] = delta;
+            final_choice["finish_reason"] = SimpleJSON(gen_result.finish_reason);
+            SimpleJSON final_choices = SimpleJSON::array();
+            final_choices.push_back(final_choice);
+            final_chunk["choices"] = final_choices;
+
+            SimpleJSON usage = SimpleJSON::object();
+            usage["prompt_tokens"] = SimpleJSON(static_cast<int64_t>(gen_result.prompt_tokens));
+            usage["completion_tokens"] = SimpleJSON(static_cast<int64_t>(gen_result.completion_tokens));
+            usage["total_tokens"] = SimpleJSON(static_cast<int64_t>(gen_result.prompt_tokens + gen_result.completion_tokens));
+            final_chunk["usage"] = usage;
+
+            std::string final_sse = "data: " + final_chunk.dump() + "\n\n";
+            platform::socket_send(client_fd, final_sse.c_str(), static_cast<int>(final_sse.size()));
+
+            // 发送结束标志
+            std::string done = "data: [DONE]\n\n";
+            platform::socket_send(client_fd, done.c_str(), static_cast<int>(done.size()));
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "[HTTP] Stream error: " << e.what() << std::endl;
@@ -627,7 +667,7 @@ HttpResponse HttpServer::handle_completions(const HttpRequest& req) {
         float temperature = json.get_float("temperature", 0.7);
         float top_p = json.get_float("top_p", 0.9);
         int max_tokens = static_cast<int>(json.get_int("max_tokens", 2048));
-        float repetition_penalty = json.get_float("repetition_penalty", 1.3);
+        float repetition_penalty = json.get_float("repetition_penalty", 1.15);
 
         std::lock_guard<std::mutex> lock(model_mutex_);
         model_.reset();
@@ -641,7 +681,7 @@ HttpResponse HttpServer::handle_completions(const HttpRequest& req) {
         SimpleJSON choice = SimpleJSON::object();
         choice["text"] = SimpleJSON(gen_result.text);
         choice["index"] = SimpleJSON(0);
-        choice["finish_reason"] = SimpleJSON("stop");
+        choice["finish_reason"] = SimpleJSON(gen_result.finish_reason);
 
         SimpleJSON choices = SimpleJSON::array();
         choices.push_back(choice);

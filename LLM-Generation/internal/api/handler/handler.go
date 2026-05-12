@@ -2,9 +2,11 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -70,7 +72,13 @@ func (h *Handler) Generate(c *gin.Context) {
 		return
 	}
 
-	result, err := h.orch.Generate(c.Request.Context(), req)
+	// 设置请求级别超时，确保在 WriteTimeout 之前返回错误
+	// 注意：本地大模型推理速度很慢（14B Q4 在 CPU 上约 0.16 tok/s），
+	// 生成一个完整回答可能需要 10-30 分钟，因此超时需要设得足够大。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+	defer cancel()
+
+	result, err := h.orch.Generate(ctx, req)
 	if err != nil {
 		h.logger.Error("generation failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, APIResponse{
@@ -84,7 +92,14 @@ func (h *Handler) Generate(c *gin.Context) {
 
 // handleStream handles streaming response via Server-Sent Events (SSE).
 func (h *Handler) handleStream(c *gin.Context, req domain.GenerateRequest) {
-	streamCh, providerName, err := h.orch.GenerateStream(c.Request.Context(), req)
+	// 设置请求级别超时 (与非流式路径一致)，作为流式连接的安全兜底。
+	// 由于 WriteTimeout 已禁用 (SSE 不兼容)，这里是唯一的超时保护。
+	// 注意：本地大模型推理速度很慢（14B Q4 在 CPU 上约 0.16 tok/s），
+	// 生成一个完整回答可能需要 10-30 分钟，因此超时需要设得足够大。
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+	defer cancel()
+
+	streamCh, providerName, err := h.orch.GenerateStream(ctx, req)
 	if err != nil {
 		h.logger.Error("stream generation failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, APIResponse{
@@ -96,19 +111,51 @@ func (h *Handler) handleStream(c *gin.Context, req domain.GenerateRequest) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // 禁用反向代理 buffering
 	c.Header("X-Provider", providerName)
 
 	c.Writer.Flush()
 	flusher, _ := c.Writer.(http.Flusher)
 
-	for chunk := range streamCh {
-		data, _ := json.Marshal(chunk)
-		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
-		if flusher != nil {
-			flusher.Flush()
-		}
-		if chunk.Done {
-			break
+	// 心跳机制：如果 LLM 推理较慢（token 间隔长），定期发送 SSE 注释行
+	// 防止中间代理/负载均衡器因空闲超时而关闭连接。
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case chunk, ok := <-streamCh:
+			if !ok {
+				// channel 已关闭，流结束
+				return
+			}
+			data, _ := json.Marshal(chunk)
+			fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if chunk.Done {
+				return
+			}
+		case <-heartbeat.C:
+			// SSE 注释行 (以 ":" 开头)，客户端会忽略，但能保持连接活跃
+			fmt.Fprintf(c.Writer, ": heartbeat\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		case <-ctx.Done():
+			// 超时，发送错误事件并结束
+			errChunk := domain.StreamChunk{
+				Content:      "[error: request timeout]",
+				Done:         true,
+				FinishReason: "timeout",
+			}
+			data, _ := json.Marshal(errChunk)
+			fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
 		}
 	}
 }

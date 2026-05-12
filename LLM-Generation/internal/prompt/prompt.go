@@ -72,7 +72,14 @@ func (m *Manager) BuildMessages(req domain.GenerateRequest) []domain.Message {
 func (m *Manager) buildSystemPrompt(req domain.GenerateRequest) string {
 	// Explicit system prompt takes priority.
 	if req.SystemPrompt != "" {
-		return req.SystemPrompt
+		// 先尝试将 SystemPrompt 当作 template key 来解析 (e.g. "code_generate")
+		if tmpl, ok := m.templates[req.SystemPrompt]; ok {
+			// 将 default_system（含语言约束等通用规则）与具体模板拼接。
+			// 使用明确的分隔，让模型理解这是两层指令。
+			return m.defaultSystem + "\n## 本次任务要求\n" + tmpl
+		}
+		// 不是已知 key，当作字面 system prompt 使用
+		return m.defaultSystem + "\n## 本次任务要求\n" + req.SystemPrompt
 	}
 
 	// If RAG context is provided, use RAG system prompt.
@@ -86,33 +93,12 @@ func (m *Manager) buildSystemPrompt(req domain.GenerateRequest) string {
 	return m.defaultSystem
 }
 
-// buildUserPrompt enhances the user prompt with NLU metadata if available.
+// buildUserPrompt returns the user prompt without NLU metadata injection.
+// NLU metadata (intent, entities) was previously prepended to the prompt,
+// but testing shows it adds unnecessary tokens without improving quality.
+// The intent is already used for system prompt template selection.
 func (m *Manager) buildUserPrompt(req domain.GenerateRequest) string {
 	prompt := req.Prompt
-
-	// If we have NLU results, add structured context.
-	if req.NLUResult != nil {
-		var parts []string
-		parts = append(parts, fmt.Sprintf("[Intent: %s (%.2f)]", req.NLUResult.Intent, req.NLUResult.Confidence))
-
-		if len(req.NLUResult.Entities) > 0 {
-			var entities []string
-			for _, e := range req.NLUResult.Entities {
-				entities = append(entities, fmt.Sprintf("%s=%s", e.Type, e.Value))
-			}
-			parts = append(parts, fmt.Sprintf("[Entities: %s]", strings.Join(entities, ", ")))
-		}
-
-		if len(req.NLUResult.Slots) > 0 {
-			var slots []string
-			for k, v := range req.NLUResult.Slots {
-				slots = append(slots, fmt.Sprintf("%s=%s", k, v))
-			}
-			parts = append(parts, fmt.Sprintf("[Slots: %s]", strings.Join(slots, ", ")))
-		}
-
-		prompt = strings.Join(parts, " ") + "\n\n" + prompt
-	}
 
 	// If RAG context is provided but not in system prompt, add inline.
 	if len(req.Context) > 0 && req.SystemPrompt != "" {
@@ -124,12 +110,17 @@ func (m *Manager) buildUserPrompt(req domain.GenerateRequest) string {
 }
 
 // formatContext formats RAG context items into a readable string.
+// Limits to top 3 results to keep system prompt concise and reduce prefill tokens.
 func (m *Manager) formatContext(items []domain.ContextItem) string {
 	var parts []string
-	for i, item := range items {
-		part := fmt.Sprintf("[%d] %s", i+1, item.Content)
-		if item.Source != "" {
-			part += fmt.Sprintf(" (source: %s)", item.Source)
+	limit := 3
+	if len(items) < limit {
+		limit = len(items)
+	}
+	for i := 0; i < limit; i++ {
+		part := fmt.Sprintf("[%d] %s", i+1, items[i].Content)
+		if items[i].Source != "" {
+			part += fmt.Sprintf(" (source: %s)", items[i].Source)
 		}
 		parts = append(parts, part)
 	}

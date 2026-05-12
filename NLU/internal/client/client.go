@@ -2,6 +2,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -24,7 +25,13 @@ func NewRAGClient(baseURL string, timeout time.Duration) *RAGClient {
 	}
 	return &RAGClient{
 		baseURL: baseURL,
-		client:  &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 }
 
@@ -128,8 +135,9 @@ func (c *RAGClient) HealthCheck(ctx context.Context) error {
 
 // LLMClient is an HTTP client for the LLM Generation service.
 type LLMClient struct {
-	baseURL string
-	client  *http.Client
+	baseURL      string
+	client       *http.Client // 用于普通请求 (带 Timeout)
+	streamClient *http.Client // 用于 SSE 流式请求 (无 Timeout, 依赖 context 控制取消)
 }
 
 // NewLLMClient creates a new LLM Generation service client.
@@ -137,9 +145,21 @@ func NewLLMClient(baseURL string, timeout time.Duration) *LLMClient {
 	if timeout == 0 {
 		timeout = 120 * time.Second
 	}
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &LLMClient{
 		baseURL: baseURL,
-		client:  &http.Client{Timeout: timeout},
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		},
+		// SSE 流式请求不能用 http.Client.Timeout —— 它覆盖整个请求生命周期（包括读取
+		// 流式 body），会在推理时间过长时直接杀死连接。超时由调用方的 context 控制。
+		streamClient: &http.Client{
+			Transport: transport,
+		},
 	}
 }
 
@@ -198,6 +218,7 @@ type GenerateResponse struct {
 	Provider       string `json:"provider"`
 	Model          string `json:"model"`
 	FinishReason   string `json:"finish_reason"`
+	Truncated      bool   `json:"-"` // derived: true if finish_reason == "length"
 }
 
 // Generate calls the LLM Generation service to produce content.
@@ -242,7 +263,88 @@ func (c *LLMClient) Generate(ctx context.Context, req GenerateRequest) (*Generat
 		return nil, fmt.Errorf("LLM generate failed: %s", msg)
 	}
 
+	// 标记是否因 max_tokens 截断
+	if apiResp.Data.FinishReason == "length" {
+		apiResp.Data.Truncated = true
+	}
+
 	return apiResp.Data, nil
+}
+
+// StreamChunk is a single chunk from streaming LLM generation.
+type StreamChunk struct {
+	Content      string `json:"content"`
+	Done         bool   `json:"done"`
+	FinishReason string `json:"finish_reason,omitempty"`
+	FullContent  string `json:"full_content,omitempty"`
+	Provider     string `json:"provider,omitempty"`
+	Model        string `json:"model,omitempty"`
+}
+
+// GenerateStream calls the LLM Generation service with streaming enabled.
+// Returns a channel that emits parsed SSE chunks.
+func (c *LLMClient) GenerateStream(ctx context.Context, req GenerateRequest) (<-chan StreamChunk, error) {
+	req.Stream = true
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal generate request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/llm/generate", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create generate request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	resp, err := c.streamClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("LLM stream request failed: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("LLM stream returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	ch := make(chan StreamChunk, 64)
+	go func() {
+		defer close(ch)
+		defer resp.Body.Close()
+
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64*1024), 256*1024) // 增大 buffer 防止大 chunk 截断
+		receivedDone := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			// SSE format: "data: {...}"
+			if len(line) < 6 || line[:6] != "data: " {
+				continue
+			}
+			data := line[6:]
+			if data == "[DONE]" {
+				ch <- StreamChunk{Done: true}
+				receivedDone = true
+				return
+			}
+			var chunk StreamChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				continue
+			}
+			ch <- chunk
+			if chunk.Done {
+				receivedDone = true
+				return
+			}
+		}
+		// scanner 结束但未收到 done 信号（连接断开/出错），发送兜底 done
+		if !receivedDone {
+			ch <- StreamChunk{Done: true, FinishReason: "disconnect"}
+		}
+	}()
+
+	return ch, nil
 }
 
 // HealthCheck checks if the LLM Generation service is healthy.

@@ -1,33 +1,34 @@
 # NLU Microservice Configuration
 #
-# Architecture: NLU(:8080) → RAG(:8081) → LLM-Generation(:8082) → Local-LLM(:11434)
+# Architecture: NLU(:8080) → RAG(:8081) → LLM-Generation(:8082) → Local-LLM C++(:11434)
 # Local-LLM (C++) provides OpenAI-compatible /v1/chat/completions API.
 
 server:
   host: "0.0.0.0"
   port: 8080
   read_timeout: 600   # seconds (LLM inference can be slow)
-  write_timeout: 600  # seconds
+  write_timeout: 0    # 禁用: SSE 流式连接不能用 WriteTimeout (它从请求头读取开始计时，Flush 不重置)
+                      # 超时由 handler 层 context.WithTimeout 控制
   mode: "debug"       # "debug", "release", "test"
 
 llm:
-  provider: "openai"  # "openai" to use Local-LLM via OpenAI-compatible API
+  provider: "openai"  # Use "openai" to route to Local-LLM C++ engine (OpenAI-compatible API)
   temperature: 0.1
-  max_tokens: 2048
+  max_tokens: 4096
   max_retries: 3
   timeout: 600  # seconds (local model inference may take time)
 
-  # OpenAI-compatible API → points to Local-LLM (C++)
+  # OpenAI-compatible API → points to Local-LLM C++ engine (/v1/chat/completions)
   openai:
-    api_key: "not-needed"  # Local-LLM doesn't require an API key
-    base_url: "http://localhost:11434/v1"  # Local-LLM C++ OpenAI-compatible endpoint
-    model: "Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+    api_key: "not-needed"
+    base_url: "http://localhost:11434/v1"
+    model: "local-llm"
     org_id: ""
 
-  # Native Ollama API (backup/alternative)
+  # Native Ollama API (not used: Local-LLM C++ has no /api/chat endpoint)
   ollama:
     base_url: "http://localhost:11434"
-    model: "qwen2.5-coder:7b-instruct-q4_K_M"
+    model: "qwen2.5-coder-3b-instruct-q8_0"
 
 nlu:
   default_capabilities:

@@ -223,16 +223,17 @@ type AskRequest struct {
 	Language  string `json:"language,omitempty"`
 	TopK      int    `json:"top_k,omitempty"`    // RAG search top-K (default 5)
 	Provider  string `json:"provider,omitempty"` // LLM provider override
-	Stream    bool   `json:"stream,omitempty"`   // Stream the final response
+	Stream    *bool  `json:"stream,omitempty"`   // Stream the final response (default: true)
 }
 
 // AskResponse is the full orchestrated pipeline response.
 type AskResponse struct {
-	Answer   string     `json:"answer"`            // Final generated answer
-	NLU      *NLUResult `json:"nlu,omitempty"`     // NLU analysis result
-	Sources  []Source   `json:"sources,omitempty"` // RAG retrieved sources
-	Provider string     `json:"provider,omitempty"`
-	Model    string     `json:"model,omitempty"`
+	Answer    string     `json:"answer"`            // Final generated answer
+	NLU       *NLUResult `json:"nlu,omitempty"`     // NLU analysis result
+	Sources   []Source   `json:"sources,omitempty"` // RAG retrieved sources
+	Provider  string     `json:"provider,omitempty"`
+	Model     string     `json:"model,omitempty"`
+	Truncated bool       `json:"truncated,omitempty"` // true if the answer was truncated by max_tokens
 }
 
 // Source is a piece of context retrieved by RAG.

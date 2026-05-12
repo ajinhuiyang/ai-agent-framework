@@ -29,9 +29,14 @@ func New(apiKey, baseURL, model, name string) *Provider {
 	if baseURL != "" {
 		config.BaseURL = baseURL
 	}
-	// Local LLM inference can take minutes; set a generous timeout.
+	// 不设置 http.Client.Timeout: 它覆盖整个请求生命周期（包括读取流式 body），
+	// 会在本地大模型推理时间较长时强制断开 SSE 流。
+	// 超时由调用方的 context.WithTimeout 控制。
 	config.HTTPClient = &http.Client{
-		Timeout: 10 * time.Minute,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
 	}
 	if name == "" {
 		name = "openai"
@@ -66,6 +71,16 @@ func (p *Provider) Complete(ctx context.Context, messages []domain.Message, conf
 		}
 		if len(config.StopWords) > 0 {
 			req.Stop = config.StopWords
+		}
+		// repetition_penalty → OpenAI 标准字段 frequency_penalty + presence_penalty
+		// Local-LLM C++ 会读取这两个字段并转换为 repetition_penalty
+		if config.RepetitionPenalty > 0 && config.RepetitionPenalty != 1.0 {
+			// frequency_penalty 控制基于频率的惩罚 (OpenAI 范围 0~2)
+			// presence_penalty 控制出现过的 token 的惩罚 (OpenAI 范围 -2~2)
+			// 我们将 repetition_penalty 拆分: presence 控制是否惩罚，frequency 控制力度
+			penalty := float32(config.RepetitionPenalty - 1.0) // 1.15 → 0.15
+			req.FrequencyPenalty = penalty * 2.0               // 0.15 → 0.3
+			req.PresencePenalty = penalty * 1.5                // 0.15 → 0.225
 		}
 	}
 
@@ -115,6 +130,12 @@ func (p *Provider) CompleteStream(ctx context.Context, messages []domain.Message
 		if len(config.StopWords) > 0 {
 			req.Stop = config.StopWords
 		}
+		// repetition_penalty → OpenAI 标准字段 (与 Complete 一致)
+		if config.RepetitionPenalty > 0 && config.RepetitionPenalty != 1.0 {
+			penalty := float32(config.RepetitionPenalty - 1.0)
+			req.FrequencyPenalty = penalty * 2.0
+			req.PresencePenalty = penalty * 1.5
+		}
 	}
 
 	stream, err := p.client.CreateChatCompletionStream(ctx, req)
@@ -127,10 +148,19 @@ func (p *Provider) CompleteStream(ctx context.Context, messages []domain.Message
 		defer close(ch)
 		defer stream.Close()
 
+		// 记录最后收到的 finish_reason，用于 EOF 时的兜底
+		lastFinishReason := ""
+
 		for {
 			resp, err := stream.Recv()
 			if errors.Is(err, io.EOF) {
-				ch <- llm.StreamEvent{Done: true, FinishReason: "stop"}
+				// EOF 表示流结束。如果之前已经通过 finish_reason chunk 发送了 Done 事件，
+				// 这里就不需要再发了。如果没有（某些 LLM 不发 finish_reason chunk），
+				// 则发送兜底 Done 事件。
+				if lastFinishReason == "" {
+					lastFinishReason = "stop"
+				}
+				ch <- llm.StreamEvent{Done: true, FinishReason: lastFinishReason}
 				return
 			}
 			if err != nil {
@@ -144,8 +174,9 @@ func (p *Provider) CompleteStream(ctx context.Context, messages []domain.Message
 					Content: choice.Delta.Content,
 				}
 				if choice.FinishReason != "" {
+					lastFinishReason = string(choice.FinishReason)
 					event.Done = true
-					event.FinishReason = string(choice.FinishReason)
+					event.FinishReason = lastFinishReason
 				}
 				ch <- event
 				if event.Done {

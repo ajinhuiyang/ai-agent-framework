@@ -5,6 +5,8 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -83,6 +85,23 @@ func (o *Orchestrator) Generate(ctx context.Context, req domain.GenerateRequest)
 		return nil, fmt.Errorf("generation failed: %w", err)
 	}
 
+	// 输出完整性校验 — 仅修复未闭合的代码块，不自动重试
+	// 自动重试对本地模型来说代价太大（推理时间翻倍），改为只做修复
+	truncated := result.FinishReason == "length"
+
+	if truncated || detectIncompleteContent(result.Content) {
+		if truncated {
+			o.logger.Warn("LLM output truncated (finish_reason=length)",
+				zap.Int("completion_tokens", result.Usage.CompletionTokens),
+			)
+		}
+		result.Content = repairTruncatedContent(result.Content)
+	}
+
+	// 代码块后处理修复 — 修复常见的代码语法问题
+	// (无效端口号、未闭合括号/引号、缺少关键调用等)
+	result.Content = repairCodeBlocks(result.Content)
+
 	// Update conversation.
 	convID := req.ConversationID
 	if convID != "" {
@@ -139,19 +158,76 @@ func (o *Orchestrator) GenerateStream(ctx context.Context, req domain.GenerateRe
 			}
 
 			fullContent += event.Content
+
+			if event.Done {
+				// 流结束：检测并修复截断内容
+				finishReason := event.FinishReason
+				truncated := finishReason == "length"
+
+				// 只在明确截断 (finish_reason=length) 时才修复。
+				// finish_reason=stop 表示模型自主结束（EOS），即使内容看起来
+				// "不完整" 也不应强行追加修复补丁，否则会产生碎片文字。
+				if truncated {
+					o.logger.Warn("stream output truncated (finish_reason=length)",
+						zap.Int("content_len", len(fullContent)),
+					)
+					repairedContent := repairTruncatedContent(fullContent)
+					// 发送修复补丁（仅追加部分）
+					if len(repairedContent) > len(fullContent) {
+						patch := repairedContent[len(fullContent):]
+						outCh <- domain.StreamChunk{
+							Content:      patch,
+							Done:         false,
+							FinishReason: "",
+						}
+						fullContent = repairedContent
+					}
+				}
+
+				// 代码块后处理修复
+				repairedFull := repairCodeBlocks(fullContent)
+
+				// 发送最终 done 事件（含修复后的完整内容）
+				outCh <- domain.StreamChunk{
+					Content:      "",
+					Done:         true,
+					FinishReason: finishReason,
+					FullContent:  repairedFull,
+				}
+
+				// Update conversation after streaming completes.
+				if convID != "" {
+					o.updateConversation(convID, req.Prompt, repairedFull)
+				}
+				return
+			}
+
 			outCh <- domain.StreamChunk{
 				Content:      event.Content,
 				Done:         event.Done,
 				FinishReason: event.FinishReason,
 			}
+		}
 
-			if event.Done {
-				// Update conversation after streaming completes.
-				if convID != "" {
-					o.updateConversation(convID, req.Prompt, fullContent)
+		// channel 关闭但未收到 Done 事件（异常断开）
+		// 仍然尝试修复并发送兜底 done
+		if fullContent != "" {
+			if detectIncompleteContent(fullContent) {
+				repairedContent := repairTruncatedContent(fullContent)
+				if len(repairedContent) > len(fullContent) {
+					patch := repairedContent[len(fullContent):]
+					outCh <- domain.StreamChunk{
+						Content:      patch,
+						Done:         false,
+						FinishReason: "",
+					}
 				}
-				return
 			}
+		}
+		outCh <- domain.StreamChunk{
+			Content:      "",
+			Done:         true,
+			FinishReason: "disconnect",
 		}
 	}()
 
@@ -239,6 +315,9 @@ func (o *Orchestrator) mergeConfig(reqConfig *domain.GenerateConfig) *domain.Gen
 		if reqConfig.TopK > 0 {
 			config.TopK = reqConfig.TopK
 		}
+		if reqConfig.RepetitionPenalty > 0 {
+			config.RepetitionPenalty = reqConfig.RepetitionPenalty
+		}
 		if len(reqConfig.StopWords) > 0 {
 			config.StopWords = reqConfig.StopWords
 		}
@@ -289,4 +368,190 @@ func (o *Orchestrator) updateConversation(convID, userMsg, assistantMsg string) 
 	if o.maxTurns > 0 && len(conv.Messages) > o.maxTurns*2 {
 		conv.Messages = conv.Messages[len(conv.Messages)-o.maxTurns*2:]
 	}
+}
+
+// detectIncompleteContent 检测 LLM 输出的内容是否结构不完整。
+// 即使 finish_reason 是 "stop"，小模型也可能提前 EOS 导致输出不完整。
+func detectIncompleteContent(content string) bool {
+	// 1. 代码块 ``` 未闭合
+	if strings.Count(content, "```")%2 != 0 {
+		return true
+	}
+
+	// 2. 包含代码块但内容在代码块结束后立即终止（没有任何收尾文字）
+	// 这种情况通常正常，跳过
+
+	// 3. 内容以明显的半句话结尾（句末没有标点、代码块内最后一行不完整）
+	trimmed := strings.TrimRight(content, " \t\n\r")
+	if len(trimmed) == 0 {
+		return false
+	}
+
+	// 如果内容以 ``` 结尾（代码块正常闭合），不认为不完整
+	if strings.HasSuffix(trimmed, "```") {
+		return false
+	}
+
+	// 检查是否以常见的中断模式结尾
+	incompleteEndings := []string{
+		"的", "到", "在", "为", "和", "与", "或", "而", "但", // 中文虚词结尾
+		"the", "a", "an", "to", "of", "in", "for", "and", "or", // 英文虚词结尾
+		"(", "[", "{", ",", ":", "=", "+", "-", "*", "/", // 运算符/括号未闭合
+	}
+	for _, ending := range incompleteEndings {
+		if strings.HasSuffix(trimmed, ending) {
+			return true
+		}
+	}
+
+	// 检查最后一行是否像被截断的代码注释（以 // 开头但很短）
+	lastNL := strings.LastIndex(trimmed, "\n")
+	if lastNL >= 0 {
+		lastLine := strings.TrimSpace(trimmed[lastNL+1:])
+		if strings.HasPrefix(lastLine, "//") && len(lastLine) < 10 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// repairTruncatedContent 尝试修复因截断或不完整而有结构缺陷的内容。
+// 主要处理：
+// 1. 代码块 ``` 未闭合 — 补上闭合标记
+// 2. 行内代码 ` 未闭合 — 补上闭合标记
+// 3. 在末尾追加截断提示
+func repairTruncatedContent(content string) string {
+	// 统计 ``` 出现次数，奇数表示有未闭合的代码块
+	tripleBacktickCount := strings.Count(content, "```")
+	if tripleBacktickCount%2 != 0 {
+		// 未闭合的代码块: 找到最后一个完整行，然后闭合
+		if lastNL := strings.LastIndex(content, "\n"); lastNL > 0 {
+			content = content[:lastNL+1]
+		}
+		content += "\n```\n"
+	}
+
+	// 检查行内代码 ` 是否闭合（在最后一个 ``` 之后的部分）
+	lastTriple := strings.LastIndex(content, "```")
+	tail := content
+	if lastTriple >= 0 {
+		tail = content[lastTriple+3:]
+	}
+	if strings.Count(tail, "`")%2 != 0 {
+		content += "`"
+	}
+
+	content += "\n\n> **注意**: 以上内容可能不完整，请尝试缩小问题范围或增加 max_tokens 配置。"
+	return content
+}
+
+// repairCodeBlocks 对生成内容中的代码块进行后处理修复。
+// 修复以下常见问题：
+// 1. 未闭合的字符串字面量
+// 2. 未闭合的括号 ()、{}
+// 3. Go 代码缺少 http.ListenAndServe 等关键调用
+// 4. 无效的端口号重复 (如 808080)
+func repairCodeBlocks(content string) string {
+	// 正则匹配 ```lang\n...``` 代码块
+	re := regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
+	return re.ReplaceAllStringFunc(content, func(block string) string {
+		// 提取语言和代码体
+		matches := re.FindStringSubmatch(block)
+		if len(matches) < 3 {
+			return block
+		}
+		lang := matches[1]
+		code := matches[2]
+
+		code = repairCode(code, lang)
+		return "```" + lang + "\n" + code + "```"
+	})
+}
+
+// repairCode 修复单个代码片段中的语法问题。
+func repairCode(code string, lang string) string {
+	// ===== 1. 修复重复端口号 =====
+	// 直接替换已知的退化模式
+	for _, bad := range []string{"80808080", "808080", "80808"} {
+		if strings.Contains(code, bad) {
+			code = strings.ReplaceAll(code, bad, "8080")
+		}
+	}
+
+	// ===== 2. 修复不完整的 if err := ... 语句 =====
+	// 模型经常生成 `if err := someFunc(...)` 后直接换行，缺少 `; err != nil { log.Fatal(err) }`
+	lines := strings.Split(code, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// 匹配: if err := xxx(...) 但没有 ; err != nil {
+		if strings.Contains(trimmed, "if err :=") &&
+			strings.HasSuffix(trimmed, ")") &&
+			!strings.Contains(trimmed, "err != nil") {
+			lines[i] = line + "; err != nil {\n\t\tlog.Fatal(err)\n\t}"
+		}
+		// 匹配: if err := xxx(...)\n 后面直接是 } (缺少 ; err != nil { ... })
+		if strings.Contains(trimmed, "if err :=") &&
+			!strings.HasSuffix(trimmed, ")") &&
+			!strings.Contains(trimmed, "err != nil") &&
+			strings.Contains(trimmed, ")") {
+			// 在最后一个 ) 后插入 ; err != nil { ... }
+			lastParen := strings.LastIndex(line, ")")
+			if lastParen > 0 {
+				lines[i] = line[:lastParen+1] + "; err != nil {\n\t\tlog.Fatal(err)\n\t}"
+			}
+		}
+	}
+	code = strings.Join(lines, "\n")
+
+	// ===== 3. 修复未闭合的字符串字面量 =====
+	lines = strings.Split(code, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+			continue
+		}
+		// 计算行内双引号数量（忽略转义的 \"）
+		unescaped := strings.ReplaceAll(line, `\"`, "")
+		quoteCount := strings.Count(unescaped, `"`)
+		if quoteCount%2 != 0 {
+			// 奇数个引号 — 找合适位置补闭合引号
+			line = strings.TrimRight(line, " \t\n\r")
+			if strings.HasSuffix(line, ")") {
+				line = line[:len(line)-1] + "\")"
+			} else {
+				line += "\""
+			}
+			lines[i] = line
+		}
+	}
+	code = strings.Join(lines, "\n")
+
+	// ===== 3. 修复未闭合的括号 =====
+	openParens := strings.Count(code, "(") - strings.Count(code, ")")
+	openBraces := strings.Count(code, "{") - strings.Count(code, "}")
+
+	suffix := ""
+	for i := 0; i < openParens; i++ {
+		suffix += ")\n"
+	}
+	for i := 0; i < openBraces; i++ {
+		suffix += "}\n"
+	}
+	if suffix != "" {
+		code = strings.TrimRight(code, "\n") + "\n" + suffix
+	}
+
+	// ===== 4. Go: 缺少 http.ListenAndServe 时插入 =====
+	if (lang == "go" || lang == "Go") && strings.Contains(code, "func main()") {
+		if strings.Contains(code, "http.HandleFunc") && !strings.Contains(code, "ListenAndServe") {
+			lastBrace := strings.LastIndex(code, "}")
+			if lastBrace > 0 {
+				insertion := "\tif err := http.ListenAndServe(\":8080\", nil); err != nil {\n\t\tlog.Fatal(err)\n\t}\n"
+				code = code[:lastBrace] + insertion + code[lastBrace:]
+			}
+		}
+	}
+
+	return code
 }

@@ -8,8 +8,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # 编译选项
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -ffast-math")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
+
+# Apple Silicon: 使用原生指令集 (NEON + AMX + FP16)
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -mcpu=apple-m1")
+endif()
 
 # 默认 Release 构建
 if(NOT CMAKE_BUILD_TYPE)

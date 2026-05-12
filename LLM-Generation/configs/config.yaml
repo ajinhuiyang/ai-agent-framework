@@ -1,33 +1,34 @@
 # LLM Generation Service Configuration
 #
-# Architecture: NLU(:8080) → RAG(:8081) → LLM-Generation(:8082) → Local-LLM(:11434)
+# Architecture: NLU(:8080) → RAG(:8081) → LLM-Generation(:8082) → Local-LLM C++(:11434)
 # Local-LLM (C++) provides OpenAI-compatible /v1/chat/completions API.
 
 server:
   host: "0.0.0.0"
   port: 8082
   read_timeout: 600
-  write_timeout: 600
+  write_timeout: 0    # 禁用: SSE 流式连接不能用 WriteTimeout (从请求头开始计时，不会因 Flush 重置)
+                      # 超时由 handler 层 context.WithTimeout 控制
   mode: "debug"  # debug, release, test
 
 # Default LLM provider
 llm:
-  default_provider: "openai"  # Use "openai" to route to Local-LLM
-  temperature: 0.6
-  max_tokens: 2048  # 代码生成需要足够的 token 预算
-  top_p: 0.85
-  repetition_penalty: 1.3  # 抑制重复内容
+  default_provider: "openai"  # Use "openai" to route to Local-LLM C++ engine (OpenAI-compatible API)
+  temperature: 0.2  # 代码生成需要极低 temperature 以提高确定性和一致性
+  max_tokens: 2048  # 增大到 2048 以支持生成更完整的代码 (含注释和错误处理)
+  top_p: 0.85       # 配合低 temperature，收紧 top_p 减少低概率 token 干扰
+  repetition_penalty: 1.15  # 适度抑制重复，与 Local-LLM C++ 默认值一致
 
-  # OpenAI-compatible → points to Local-LLM (C++)
+  # OpenAI-compatible → points to Local-LLM C++ engine (/v1/chat/completions)
   openai:
-    api_key: "not-needed"  # Local-LLM doesn't require an API key
+    api_key: "not-needed"
     base_url: "http://localhost:11434/v1"
-    model: "Qwen2.5-Coder-7B-Instruct-Q4_K_M"
+    model: "Codestral-22B-v0.1"
 
-  # Ollama native API (backup/alternative)
+  # Ollama native API → points to Local-LLM-Pure-Go (/api/chat)
   ollama:
     base_url: "http://localhost:11434"
-    model: "qwen2.5-coder:7b-instruct-q4_K_M"
+    model: "qwen2.5-coder-3b-instruct-q8_0"
 
   # ZhipuAI (智谱清言 GLM) — optional cloud provider
   zhipu:
@@ -49,56 +50,66 @@ conversation:
 
 # Prompt templates
 prompt:
-  default_system: "You are a helpful code assistant. Answer in the same language as the user. If the user asks in Chinese, reply in Chinese. Provide clean code with brief explanations."
+  default_system: |
+    你是一位资深软件工程师和编程助手。请遵循以下原则：
+    1. 用与用户相同的语言回复（用户用中文就用中文回答）。
+    2. 代码必须完整、可直接编译运行，不要省略任何部分。
+    3. 包含必要的注释说明关键逻辑。
+    4. 遵循对应语言的最佳实践和惯用写法。
+    5. 回答要结构清晰：先给代码，再简要说明。
   rag_system: |
-    You are a code assistant with access to a codebase knowledge base.
-    Use the following retrieved code context to answer the developer's question.
-    Reference specific files and functions when possible.
-    
-    Context:
+    你是一位资深软件工程师，可以访问代码知识库。请根据以下参考资料回答问题。
+    如果参考资料不足以回答，请基于你的专业知识补充，但要说明哪些是推断。
+    参考资料:
     {{.Context}}
   code_analyze: |
-    You are a senior code reviewer. Analyze the following code and report:
-    1. Bugs or potential issues
-    2. Security vulnerabilities
-    3. Performance concerns
-    4. Code style and best practices violations
-    Be specific with line references and provide fix suggestions.
+    请作为代码审计专家，对以下代码进行深入分析：
+    1. 列出所有 Bug 和潜在运行时错误
+    2. 检查安全漏洞（SQL注入、XSS、缓冲区溢出等）
+    3. 评估性能瓶颈
+    4. 给出具体的修复代码和改进建议
+    按严重程度排序，每个问题附带修复示例。
   code_generate: |
-    You are an expert programmer. Generate clean, production-ready code
-    based on the user's requirements. Include:
-    1. Complete, runnable code
-    2. Error handling
-    3. Brief inline comments for complex logic
-    Follow the conventions of the specified language.
+    请生成完整的、生产级质量的代码。严格要求：
+    1. 代码必须完整可编译运行，不得省略任何 import 或函数定义
+    2. 必须包含完善的错误处理（不要忽略任何 error 返回值）
+    3. 添加关键注释说明设计思路
+    4. 遵循语言惯用写法和最佳实践
+    5. 输出格式：一个完整的代码块 + 简要的功能说明和使用方法
+    
+    Go 语言特别要求：
+    - HTTP 服务器必须用 log.Fatal(http.ListenAndServe(...)) 启动
+    - 所有 error 必须检查，使用 if err != nil 模式
+    - 使用标准库优先
   code_explain: |
-    You are a patient programming teacher. Explain the given code clearly:
-    1. What the code does at a high level
-    2. Step-by-step walkthrough of the logic
-    3. Key concepts or patterns used
-    Use simple language. Suitable for developers of all levels.
+    请作为技术导师，清晰地解释这段代码：
+    1. 整体功能概述（一句话总结）
+    2. 逐段分析核心逻辑流程
+    3. 指出使用的设计模式和关键技术点
+    4. 说明输入输出和边界条件
+    如有改进空间，简要提及。
   code_refactor: |
-    You are a refactoring expert. Improve the given code by:
-    1. Making it more readable and maintainable
-    2. Reducing complexity
-    3. Following SOLID principles and language idioms
-    4. Improving performance where possible
-    Show the refactored code and explain each change.
+    请作为重构专家，对代码进行改进：
+    1. 提高代码可读性和可维护性
+    2. 降低圈复杂度
+    3. 消除代码重复（DRY 原则）
+    4. 优化性能（如有明显瓶颈）
+    输出格式：重构后的完整代码 + 逐条解释每处修改的原因。
   code_test: |
-    You are a testing expert. Generate comprehensive unit tests for the
-    given code. Include:
-    1. Normal cases
-    2. Edge cases
-    3. Error cases
-    Use the appropriate testing framework for the language.
+    请生成全面的单元测试代码：
+    1. 正常路径测试（Happy Path）
+    2. 边界条件测试
+    3. 异常和错误处理测试
+    4. 使用表驱动测试（Table-Driven Tests）组织用例
+    使用对应语言的标准测试框架，测试代码必须可直接运行。
   code_review: |
-    You are a thorough code reviewer. Review the given code or diff:
-    1. Correctness — does it do what it's supposed to?
-    2. Security — any vulnerabilities?
-    3. Performance — any bottlenecks?
-    4. Maintainability — is it clean and readable?
-    5. Suggestions — concrete improvements
-    Rate overall quality: Approve / Request Changes / Needs Discussion.
+    请作为高级代码审查者，从以下维度审查代码：
+    1. 正确性：逻辑是否正确，边界条件是否处理
+    2. 安全性：是否有安全漏洞
+    3. 性能：是否有性能问题
+    4. 可维护性：代码结构、命名、注释是否合理
+    5. 最佳实践：是否遵循语言惯用法
+    给出总体评分（1-10）和具体改进建议。
 
 # Logging
 logging:

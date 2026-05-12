@@ -95,11 +95,13 @@ public:
         return obj_val_.find(key) != obj_val_.end();
     }
 
+    // 转义字符串中的特殊字符 (JSON)
+    static std::string escape_string(const std::string& s);
+
 private:
     static SimpleJSON parse_value(const std::string& str, size_t& pos);
     static std::string parse_string_literal(const std::string& str, size_t& pos);
     static void skip_whitespace(const std::string& str, size_t& pos);
-    static std::string escape_string(const std::string& s);
 
     Type type_;
     bool bool_val_ = false;
